@@ -149,7 +149,7 @@ function accepted_for(path; ids = nothing)
     return acc, incomplete
 end
 
-dir   = joinpath(@__DIR__, "..", "EOSsamplerGit", "build")
+dir   = joinpath(@__DIR__, "..", "EOSsamplerLocal", "build")
 files = sort(filter(endswith(".h5"), readdir(dir; join = true)))
 
 results = Dict{String,Vector{Int}}()

@@ -52,7 +52,7 @@ const D_SOURCE       = 10 * 3.0857e19     # source distance, m
 # density and a guessed spectral normalisation. `process_eos_pt` computes both
 # from the bubble solution instead.
 const RHO_KIN  = 1.0e34                   # J/m³
-const OMEGA_GW = 0.01
+const OMEGA_GW = 0.1
 
 "Upper frequency limit of the plotted/integrated band, Hz."
 const F_HI = 5.0e7
@@ -616,7 +616,7 @@ replaces it with the sound shell model, where the same role is played by
 `(z³/2π²) P̃_gw(z)` with `z = 2π s` — the factor of 2π belongs there and only
 there.
 """
-Pgw(s) = s^3 * (7 / (4 + 3s^2))^3.5
+Pgw(s) = (10s)^3 * (7 / (4 + 3(10s)^2))^3.5
 
 """
     trapz(x, y)
