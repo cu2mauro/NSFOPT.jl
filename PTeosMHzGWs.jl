@@ -25,7 +25,7 @@ module PTeosMHzGWs
 using DelimitedFiles: readdlm
 using HDF5: h5open, read
 using JSON: parsefile
-using OrdinaryDiffEq: ODEProblem, ContinuousCallback, solve, Vern7, AutoVern7, Rodas5P
+using OrdinaryDiffEq: ODEProblem, ContinuousCallback, solve, Vern7, AutoVern7, Rodas5P #maybe consider Vern9?
 using SciMLBase: terminate!, ReturnCode
 using Roots: find_zero, Brent
 using PythonCall
@@ -48,11 +48,12 @@ const G_NEWTON       = 6.6743e-11         # SI
 const C_LIGHT        = 299792458.0        # SI
 const D_SOURCE       = 10 * 3.0857e19     # source distance, m
 
-# Placeholders used by `process_eos`: an order-of-magnitude kinetic energy
-# density and a guessed spectral normalisation. `process_eos_pt` computes both
-# from the bubble solution instead.
-const RHO_KIN  = 1.0e34                   # J/m³
-const OMEGA_GW = 0.01
+const RHO_KIN  = 3.2e33                   # J/m³
+const OMEGA_GW = 0.012
+
+# guesses for the spinning quadrupole emission
+const ETA_F = 1.0
+const SPIN = 0.2
 
 "Upper frequency limit of the plotted/integrated band, Hz."
 const F_HI = 5.0e7
@@ -205,9 +206,11 @@ struct Branch
     pc::Vector{Float64}
     Rqm::Vector{Float64}
     stab::Vector{Float64}
+    Λtd::Vector{Float64}
     Mx::Vector{Float64}
     pcx::Vector{Float64}
     stabx::Vector{Float64}
+    Λtdx::Vector{Float64}
     like::Float64
 end
 
@@ -224,9 +227,11 @@ function load_branch(f, id::Integer)
         read(f, "$g/TOV/p_cent"),
         read(f, "$g/TOV/Rqm"),
         read(f, "$g/TOV/stab"),
+        read(f, "$g/TOV/Lambda"),
         read(f, "$g/TOVext/M"),
         read(f, "$g/TOVext/p_cent"),
         read(f, "$g/TOVext/stab"),
+        read(f, "$g/TOVext/Lambda"),
         first(read(f, "$g/params/ptot")),
     )
 end
@@ -327,6 +332,8 @@ struct PreparedEoS
     dp::MonotoneCubic
     t0::Float64
     Rc::MonotoneCubic
+    Λq::MonotoneCubic
+    Λh::MonotoneCubic
 end
 
 """
@@ -350,6 +357,8 @@ function prepare_eos(br::Branch)
     Mxi  = br.Mx[stab_idxx]
     pcxi = br.pcx[stab_idxx] ./ GEV_TO_INVFM^3 ./ 1000
     Rqmi = br.Rqm[stab_idx] .* 1000
+    Lambda = br.Λtd[stab_idx]
+    Lamdbax = br.Λtdx[stab_idxx]
 
     K = min(length(Mi), length(Mxi))
     K ≥ 2 || return nothing
@@ -379,7 +388,17 @@ function prepare_eos(br::Branch)
     length(mx) ≥ 2 || return nothing
     Rc = MonotoneCubic(mx, my)
 
-    return PreparedEoS(dp, t0, Rc)
+    # Λq(M) over the full stable hadronic branch.
+    mx, my = _sorted_unique(Mi, Lambda)
+    length(mx) ≥ 2 || return nothing
+    Λq = MonotoneCubic(mx, my)
+
+    # Λh(M) over the full stable hadronic branch.
+    mx, my = _sorted_unique(Mxi, Lamdbax)
+    length(mx) ≥ 2 || return nothing
+    Λh = MonotoneCubic(mx, my)
+
+    return PreparedEoS(dp, t0, Rc, Λq, Λh)
 end
 
 _chop(v::Float64) = abs(v) < CHOP_TOL ? 0.0 : v
@@ -426,10 +445,13 @@ struct Row
     R_bubble_m::Float64     # c / f_peak
     R_core_m::Float64       # quark core radius at transition
     N_bubbles::Float64
+    M_at_nucleation::Float64
+    Λq_at_nucleation::Float64
+    Λh_at_nucleation::Float64
 end
 
-_failed(a, s, l, v) = Row(a, s, l, v, 0.0, 0.0, 0.0, -1.0)
-_never(a, s, l, v)  = Row(a, s, l, v, 0.0, 0.0, 0.0, 0.0)
+_failed(a, s, l, v) = Row(a, s, l, v, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0)
+_never(a, s, l, v)  = Row(a, s, l, v, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 """
     compute_row(prep, accretion, sigma_MeV_fm2, Lambda_MeV, v_wall) -> Row
@@ -448,7 +470,7 @@ function compute_row(prep::PreparedEoS, accretion::Real, sigma_MeV_fm2::Real,
     lm = Float64(Lambda_MeV)
     v  = Float64(v_wall)
 
-    dp, t0b, Rc = prep.dp, prep.t0, prep.Rc
+    dp, t0b, Rc, Λq, Λh = prep.dp, prep.t0, prep.Rc, prep.Λq, prep.Λh
 
     σ = sg / GEV_TO_INVFM^2 / 1000
     Λ = lm / 1000 * GEV_TO_INVMS
@@ -508,8 +530,10 @@ function compute_row(prep::PreparedEoS, accretion::Real, sigma_MeV_fm2::Real,
     # Gravitational mass at nucleation.
     M_at_nucleation = 0.5 + (t0a + tguess) * a / 1000
     R_core = M_at_nucleation < last(domain(Rc)) ? Rc(M_at_nucleation) : 0.0
+    Λq_at_nucleation = M_at_nucleation < last(domain(Λq)) ? Λq(M_at_nucleation) : 0.0
+    Λh_at_nucleation = M_at_nucleation < last(domain(Λh)) ? Λh(M_at_nucleation) : 0.0
 
-    return Row(a, sg, lm, v, fpeak_MHz, R_bubble, R_core, (R_core / R_bubble)^3)
+    return Row(a, sg, lm, v, fpeak_MHz, R_bubble, R_core, (R_core / R_bubble)^3, M_at_nucleation, Λq_at_nucleation, Λh_at_nucleation)
 end
 
 _ok(sol) = sol.retcode in (ReturnCode.Success, ReturnCode.Terminated)
@@ -603,6 +627,48 @@ function sweep(prep::PreparedEoS, accretions, sigmas, lambdas, v_ladder;
 end
 
 # ---------------------------------------------------------------------------
+# Stage 2.1: quadrupole oscillations
+# ---------------------------------------------------------------------------
+
+function f_quad(M::Float64, Λq::Float64)
+
+    ai = [0.1817, -0.006652, -0.004105, 0.0004072, 1.712e-05, -4.796e-06, 2.838e-07, -5.743e-09]
+
+    f_f = C_LIGHT^3 / (2π * G_NEWTON * M * 1.98847e30) * sum([ai[i]*log(Λq)^(i-1) for i = eachindex(ai)])
+
+    return f_f::Float64
+end
+
+function tau_quad(M::Float64, Λq::Float64)
+
+    bi = [4.514e-05, 1.907e-05, 4.3e-06, -5.025e-06, 1.133e-06, -1.165e-07, 5.851e-09, -1.167e-10]
+
+    tau_f = 1 / (C_LIGHT^3 / (G_NEWTON * M * 1.98847e30)) / sum([bi[i]*log(Λq)^(i-1) for i = eachindex(bi)])
+
+    return tau_f::Float64
+end
+
+function Love_Q(Λ::Float64)
+
+    ci = [0.194, 0.0936, 0.0474, -4.21e-3, 1.23e-4]
+
+    Qbar = exp(sum([ci[i]*log(Λ)^(i-1) for i = eachindex(ci)]))
+
+    return Qbar::Float64
+end
+
+function hcf_quad(M::Float64, Λq::Float64, Λh::Float64)
+
+    f = f_quad(M, Λq)
+    tau = tau_quad(M, Λq)
+    χ = SPIN # * C_LIGHT / (G_NEWTON * M * 1.98847e30) since SPIN is already dimensionless
+
+    h0 = ETA_F * 4*pi*f^2 / C_LIGHT^2 / D_SOURCE * (G_NEWTON * M * 1.98847e30 / C_LIGHT^2)^3 * χ^2 * (Love_Q(Λh) - Love_Q(Λq))
+
+    return (h0*sqrt(tau/2))::Float64
+end
+
+# ---------------------------------------------------------------------------
 # Stage 3: strain spectra and SNR
 # ---------------------------------------------------------------------------
 
@@ -616,7 +682,8 @@ replaces it with the sound shell model, where the same role is played by
 `(z³/2π²) P̃_gw(z)` with `z = 2π s` — the factor of 2π belongs there and only
 there.
 """
-Pgw(s) = s^3 * (7 / (4 + 3s^2))^3.5
+const KR_PEAK = 5.0
+Pgw(s) = (x = 2π * s / KR_PEAK; x^3 * (7 / (4 + 3x^2))^3.5)
 
 """
     trapz(x, y)
@@ -649,10 +716,21 @@ end
 """
     load_noise_curve(path) -> NoiseCurve
 """
-function load_noise_curve(path::AbstractString)
-    data = readdlm(path, ',', Float64)
-    f = data[:, 1]
-    asd = data[:, 2]
+function load_noise_curve(path::AbstractString, delim::AbstractChar; columnf::Integer = 1, columnasd::Integer = 2)
+    data = readdlm(path,delim)
+    f = data[:, columnf]
+    asd = data[:, columnasd]
+    typeof(f[1]) <: Real ? nothing : (popfirst!(f); popfirst!(asd))
+    p = sortperm(f)
+    f, asd = f[p], asd[p]
+    return NoiseCurve(Linear1D(log10.(f), log10.(asd)), first(f), last(f), f, asd)
+end
+
+function load_noise_curve(path::AbstractString; columnf::Integer = 1, columnasd::Integer = 2)
+    data = readdlm(path)
+    f = data[:, columnf]
+    asd = data[:, columnasd]
+    typeof(f[1]) <: Real ? nothing : (popfirst!(f); popfirst!(asd))
     p = sortperm(f)
     f, asd = f[p], asd[p]
     return NoiseCurve(Linear1D(log10.(f), log10.(asd)), first(f), last(f), f, asd)
@@ -678,6 +756,7 @@ struct EOSResult
     curves::Vector{Matrix{Float64}}
     peaks::Matrix{Float64}
     characteristic::Matrix{Float64}
+    quadrupole::Matrix{Float64}
     snr::Vector{Float64}
 end
 
@@ -705,6 +784,7 @@ function _reduce(id::Integer, like::Real, keep::Vector{Row}, noise::NoiseCurve,
     nk = length(keep)
     curves = Vector{Matrix{Float64}}(undef, nk)
     peaks  = Matrix{Float64}(undef, nk, 2)
+    quadr  = Matrix{Float64}(undef, nk, 2)
     charac = Matrix{Float64}(undef, nk, 2)
     snrs   = Vector{Float64}(undef, nk)
 
@@ -736,9 +816,12 @@ function _reduce(id::Integer, like::Real, keep::Vector{Row}, noise::NoiseCurve,
         fpk = r.fpeak_MHz * 1e6
         peaks[k, 1] = fpk
         peaks[k, 2] = sqrt(Sh(k, fpk))
+
+        quadr[k, 1] = f_quad(r.M_at_nucleation, r.Λq_at_nucleation)
+        quadr[k, 2] = hcf_quad(r.M_at_nucleation, r.Λq_at_nucleation, r.Λh_at_nucleation)
     end
 
-    return EOSResult(id, like, keep, curves, peaks, charac, snrs)
+    return EOSResult(id, like, keep, curves, peaks, charac, quadr, snrs)
 end
 
 "Rows worth keeping: enough bubbles to collide, and a frequency we can plot."
@@ -752,7 +835,7 @@ Sweep the parameter grid for one sample and reduce the surviving rows to strain
 curves, peaks, characteristic strain and SNR. Returns `nothing` if no row
 survives.
 
-The spectral model is the broken power law [`Pgw`](@ref), with the placeholder
+The spectral model is the broken power law [`Pgw`](@ref), with
 `RHO_KIN` and `OMEGA_GW`; see [`process_eos_pt`](@ref) for the sound shell
 model, where both are replaced by the bubble solution.
 """
