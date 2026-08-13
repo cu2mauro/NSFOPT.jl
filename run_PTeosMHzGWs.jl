@@ -66,8 +66,8 @@ const BUBBLE_CMAP = cgrad(:coolwarm)
 # Figure format: "pdf" for vector output (papers), "png" for a quick look.
 const FIG_EXT = "pdf"
 
-const PLOT_XLIMS = (1e4, 1e8)
-const PLOT_YLIMS = (1e-30, 1e-20)
+const PLOT_XLIMS = (5e2, 5e7)
+const PLOT_YLIMS = (1e-29, 1e-21)
 
 results_path(h5_id; outdir = OUT_DIR) = joinpath(outdir, "results_$h5_id.h5")
 
@@ -160,11 +160,13 @@ function save_results(path::AbstractString, results::Vector{EOSResult},
             f["$g/like"] = r.like
             f["$g/peaks"] = r.peaks
             f["$g/characteristic"] = r.characteristic
+            f["$g/quadrupole"] = r.quadrupole
             f["$g/snr"] = r.snr
-            # 8 × n table, columns in `Row` field order.
+            # 11 × n table, columns in `Row` field order.
             f["$g/rows"] = reduce(hcat, [[x.accretion, x.sigma_MeV_fm2, x.Lambda_MeV,
                                           x.v_wall, x.fpeak_MHz, x.R_bubble_m,
-                                          x.R_core_m, x.N_bubbles] for x in r.rows])
+                                          x.R_core_m, x.N_bubbles, x.M_at_nucleation,
+                                          x.Λq_at_nucleation, x.Λh_at_nucleation] for x in r.rows])
             npt = size(first(r.curves), 1)
             curves = Array{Float64,3}(undef, npt, 2, length(r.curves))
             for (k, c) in pairs(r.curves)
@@ -204,12 +206,13 @@ function load_results(ids; outdir = OUT_DIR)
                 g = f["eos"][key]
                 m = read(g["rows"])
                 rows = [Row(m[1, j], m[2, j], m[3, j], m[4, j],
-                            m[5, j], m[6, j], m[7, j], m[8, j]) for j in axes(m, 2)]
+                            m[5, j], m[6, j], m[7, j], m[8, j], 
+                            m[9, j], m[10, j],m[11, j]) for j in axes(m, 2)]
                 cs = read(g["curves"])
                 curves = [cs[:, :, k] for k in axes(cs, 3)]
                 push!(results, EOSResult(parse(Int, key), read(g["like"]), rows, curves,
                                          read(g["peaks"]), read(g["characteristic"]),
-                                         read(g["snr"])))
+                                         read(g["quadrupole"]), read(g["snr"])))
                 push!(sources, fid)
             end
         end
@@ -289,8 +292,11 @@ brightness(c) = red(c) + green(c) + blue(c)
 by_z_order(rs, like_hi) = sort(rs; by = r -> -brightness(like_color(r.like, like_hi)))
 
 "The two detector noise curves drawn under every strain figure."
-noise_curves() = (load_noise_curve(joinpath(@__DIR__, "ExperimentSignal", "MWB-DMR-res.csv")),
-                  load_noise_curve(joinpath(@__DIR__, "ExperimentSignal", "levitatedSensors_100m.csv")))
+noise_curves() = (load_noise_curve(joinpath(@__DIR__, "ExperimentSignal", "MWB-DMR-res.csv"), ','),
+                  load_noise_curve(joinpath(@__DIR__, "ExperimentSignal", "levitatedSensors_100m.csv"), ','),
+                  load_noise_curve(joinpath(@__DIR__, "ExperimentSignal", "LIGO5.tad"),columnf=1,columnasd=4),
+                  load_noise_curve(joinpath(@__DIR__, "ExperimentSignal", "ET-0001A-18_ETDSensitivityCurveTxtFile.txt")),
+                  load_noise_curve(joinpath(@__DIR__, "ExperimentSignal", "cosmic_explorer_strain.txt")))
 
 "Decade ticks across `lims`, one every `step` orders of magnitude."
 _log_ticks(lims, step) =
@@ -348,6 +354,84 @@ function add_noise!(p, noises)
 end
 
 # ---------------------------------------------------------------------------
+# Dataset layers
+#
+# Every strain dataset lives on the same log-log axes, so each reduces to a
+# `draw!(p, r, col)` that adds one EOS's contribution to an existing plot. The
+# standalone figures (`plot_strain`) and the combined overlay (`plot_overlay`)
+# both go through these, so a style lives in one place — and this is the surface
+# to port if the backend ever moves to CairoMakie.
+# ---------------------------------------------------------------------------
+
+const _SH_LABEL  = L"$\sqrt{S_h}\;\left[\mathrm{Hz}^{-1/2}\right]$"
+const _HC_LABEL  = L"$h_c/\sqrt{f_c}\;\left[\mathrm{Hz}^{-1/2}\right]$"
+const _GEN_LABEL = L"$\left[\mathrm{Hz}^{-1/2}\right]$"
+
+_draw_peaks!(p, r, col; marker = :circle) =
+    scatter!(p, r.peaks[:, 1], r.peaks[:, 2]; color = col, markershape = marker,
+             markersize = 2.5, markerstrokewidth = 0, label = "")
+
+_draw_characteristic!(p, r, col; marker = :circle) =
+    scatter!(p, r.characteristic[:, 1], r.characteristic[:, 2]; color = col,
+             markershape = marker, markersize = 2.5, markerstrokewidth = 0, label = "")
+
+_draw_quadrupole!(p, r, col; marker = :circle) =
+    scatter!(p, r.quadrupole[:, 1], r.quadrupole[:, 2]; color = col,
+             markershape = marker, markersize = 2.5, markerstrokewidth = 0, label = "")
+
+# One series per EOS, not per curve: an EOS's curves share a colour, so they
+# string into a single polyline with NaN between them (a NaN lifts the pen).
+# Plots' per-series overhead dominates at tens of thousands of curves, and the
+# drawn result is identical.
+function _draw_curves!(p, r, col; marker = :none)
+    xs = Float64[]
+    ys = Float64[]
+    for c in r.curves
+        append!(xs, @view c[:, 1]); push!(xs, NaN)
+        append!(ys, @view c[:, 2]); push!(ys, NaN)
+    end
+    plot!(p, xs, ys; color = col, linewidth = 0.5, label = "")
+end
+
+function _draw_envelopes!(p, r, col; marker = :none)
+    f, upper, lower = envelope(r.curves)
+    plot!(p, f, upper; fillrange = lower, fillalpha = 0.7,
+          fillcolor = col, linecolor = col, linewidth = 0.3, label = "")
+end
+
+# Ordered back-to-front: fills, then curve bundles, then point clouds, so a
+# scatter dataset always lands on top of an envelope it shares a figure with.
+# `kind` picks the y-axis label; `marker` tells the point datasets apart when
+# several are overlaid (ignored by curves/envelopes).
+const STRAIN_LAYERS = (
+    envelopes      = (draw = _draw_envelopes!,      kind = :sh, marker = :none),
+    curves         = (draw = _draw_curves!,         kind = :sh, marker = :none),
+    characteristic = (draw = _draw_characteristic!, kind = :hc, marker = :diamond),
+    quadrupole     = (draw = _draw_quadrupole!,     kind = :hc, marker = :utriangle),
+    peaks          = (draw = _draw_peaks!,          kind = :sh, marker = :circle),
+)
+
+_layer_label(kind) = kind === :sh ? _SH_LABEL : kind === :hc ? _HC_LABEL : _GEN_LABEL
+
+"""
+    _parse_layers(datasets) -> Vector{Symbol}
+
+Normalise a dataset selection — a string like `"peaks, envelopes"`, or an
+iterable of strings/symbols — to validated layer names.
+"""
+function _parse_layers(datasets)
+    raw = datasets isa AbstractString ? split(datasets, r"[\s,]+"; keepempty = false) :
+          datasets isa Union{AbstractString,Symbol} ? [datasets] : collect(datasets)
+    names = Symbol[Symbol(lowercase(string(x))) for x in raw]
+    isempty(names) && error("no datasets given")
+    valid = keys(STRAIN_LAYERS)
+    for n in names
+        n in valid || error("unknown dataset :$n; choose from $(join(valid, ", "))")
+    end
+    return names
+end
+
+# ---------------------------------------------------------------------------
 # Strain plots
 # ---------------------------------------------------------------------------
 
@@ -372,49 +456,32 @@ function plot_strain(results::Vector{EOSResult}, like_hi::Real;
         @info "  wrote" figure = joinpath(basename(figdir), name)
     end
 
-    let p = strain_axes(L"$\sqrt{S_h}\;\left[\mathrm{Hz}^{-1/2}\right]$", "Peaks")
+    let p = strain_axes(_SH_LABEL, "Peaks")
         for r in ordered
-            scatter!(p, r.peaks[:, 1], r.peaks[:, 2];
-                     color = like_color(r.like, like_hi), markersize = 2.5,
-                     markerstrokewidth = 0, label = "")
+            _draw_peaks!(p, r, like_color(r.like, like_hi))
         end
         save(add_noise!(p, noises), "peaks.$ext")
     end
 
-    let p = strain_axes(L"$\sqrt{S_h}\;\left[\mathrm{Hz}^{-1/2}\right]$", "Curves")
-        # One series per EOS, not per curve. All of an EOS's curves share a
-        # colour, so they can be strung into a single polyline with NaN between
-        # them — a NaN lifts the pen, so the segments stay separate on the page.
-        # Plots' per-series overhead dominates here (tens of thousands of curves
-        # against a few hundred EOS), and the drawn result is identical.
+    let p = strain_axes(_SH_LABEL, "Curves")
         for r in ordered
-            xs = Float64[]
-            ys = Float64[]
-            for c in r.curves
-                append!(xs, @view c[:, 1]); push!(xs, NaN)
-                append!(ys, @view c[:, 2]); push!(ys, NaN)
-            end
-            plot!(p, xs, ys; color = like_color(r.like, like_hi),
-                  linewidth = 0.5, label = "")
+            _draw_curves!(p, r, like_color(r.like, like_hi))
         end
         save(add_noise!(p, noises), "curves.$ext")
     end
 
-    let p = strain_axes(L"$h_c/\sqrt{f_c}\;\left[\mathrm{Hz}^{-1/2}\right]$", "Characteristic")
+    let p = strain_axes(_HC_LABEL, "Characteristic")
         for r in ordered
-            scatter!(p, r.characteristic[:, 1], r.characteristic[:, 2];
-                     color = like_color(r.like, like_hi), markersize = 2.5,
-                     markerstrokewidth = 0, label = "")
+            col = like_color(r.like, like_hi)
+            _draw_characteristic!(p, r, col)
+            _draw_quadrupole!(p, r, col)
         end
         save(add_noise!(p, noises), "characteristic.$ext")
     end
 
-    let p = strain_axes(L"$\sqrt{S_h}\;\left[\mathrm{Hz}^{-1/2}\right]$", "Envelopes")
+    let p = strain_axes(_SH_LABEL, "Envelopes")
         for r in ordered
-            f, upper, lower = envelope(r.curves)
-            col = like_color(r.like, like_hi)
-            plot!(p, f, upper; fillrange = lower, fillalpha = 0.7,
-                  fillcolor = col, linecolor = col, linewidth = 0.3, label = "")
+            _draw_envelopes!(p, r, like_color(r.like, like_hi))
         end
         save(add_noise!(p, noises), "envelopes.$ext")
     end
@@ -445,6 +512,81 @@ function _tag(ids)
     length(ids) == 1 && return string(first(ids))
     s = sort(collect(ids))
     return s == first(s):last(s) ? "$(first(s))-$(last(s))" : join(s, "_")
+end
+
+# Gray key mapping marker/style to dataset name, so overlaid point clouds can be
+# told apart (colour already encodes likelihood, not which dataset). The dummy
+# series carry NaN coordinates: they never touch the axes, only the legend.
+function _overlay_legend!(p, layers)
+    length(layers) > 1 || return p
+    for name in keys(STRAIN_LAYERS)
+        name in layers || continue
+        L = STRAIN_LAYERS[name]
+        if name === :envelopes
+            plot!(p, [NaN, NaN], [NaN, NaN]; seriestype = :shape,
+                  fillcolor = :gray, fillalpha = 0.5, linecolor = :gray, label = string(name))
+        elseif L.marker === :none
+            plot!(p, [NaN, NaN], [NaN, NaN]; color = :gray, linewidth = 1.5, label = string(name))
+        else
+            scatter!(p, [NaN], [NaN]; markershape = L.marker, color = :gray,
+                     markersize = 4, markerstrokewidth = 0, label = string(name))
+        end
+    end
+    plot!(p; legend = :topright, legendfontsize = 9)
+    return p
+end
+
+"""
+    plot_overlay(datasets, ids; kwargs...) -> path
+
+Overlay several strain datasets on one figure for the given result ids.
+
+`datasets` selects the layers: a string like `"peaks, envelopes"`, or a vector
+`["peaks", "envelopes", "quadrupole"]`. `ids` is as in [`plot_ids`](@ref) — an
+integer, an iterable (`0:2`), or `:all`. Available layers: $(join(keys(STRAIN_LAYERS), ", ")).
+
+Layers draw back-to-front (envelopes, curves, then point clouds), each in
+likelihood order, so the highest-likelihood EOS sit on top. Point datasets get
+distinct marker shapes; colour encodes likelihood throughout. A gray key naming
+each layer is drawn unless `legend = false`.
+
+Keywords: `outdir`, `figdir`, `ext`, `ylabel`, `title`, `name`, `noises`,
+`legend`. The figure is written to `figures_<tag>/` (as `plot_ids`), named for
+the datasets unless `name` is given.
+"""
+function plot_overlay(datasets, ids;
+                      outdir = OUT_DIR, figdir = nothing, ext::AbstractString = FIG_EXT,
+                      ylabel = nothing, title = "", name = nothing,
+                      noises = noise_curves(), legend::Bool = true)
+    layers = _parse_layers(datasets)
+    results, like_hi, sources = load_results(ids; outdir)
+    isempty(results) && error("nothing to plot")
+    ordered = by_z_order(results, like_hi)
+
+    if ylabel === nothing
+        kinds = unique(STRAIN_LAYERS[n].kind for n in layers)
+        ylabel = length(kinds) == 1 ? _layer_label(only(kinds)) : _GEN_LABEL
+    end
+
+    p = strain_axes(ylabel, title)
+    # canonical back-to-front order, restricted to the requested layers
+    for name_ in keys(STRAIN_LAYERS)
+        name_ in layers || continue
+        L = STRAIN_LAYERS[name_]
+        for r in ordered
+            L.draw(p, r, like_color(r.like, like_hi); marker = L.marker)
+        end
+    end
+    legend && _overlay_legend!(p, layers)
+    add_noise!(p, noises)
+
+    base = name === nothing ? "overlay_" * join(string.(layers), "_") : name
+    dir = figdir === nothing ? joinpath(outdir, "figures_$(_tag(unique(sources)))") : figdir
+    mkpath(dir)
+    path = joinpath(dir, "$base.$ext")
+    _savefig(p, path)
+    @info "overlay" datasets = layers files = ids eos = length(results) wrote = joinpath(basename(dir), "$base.$ext")
+    return path
 end
 
 # ---------------------------------------------------------------------------
