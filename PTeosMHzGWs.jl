@@ -48,11 +48,8 @@ const G_NEWTON       = 6.6743e-11         # SI
 const C_LIGHT        = 299792458.0        # SI
 const D_SOURCE       = 10 * 3.0857e19     # source distance, m
 
-# Placeholders used by `process_eos`: an order-of-magnitude kinetic energy
-# density and a guessed spectral normalisation. `process_eos_pt` computes both
-# from the bubble solution instead.
-const RHO_KIN  = 1.0e34                   # J/m³
-const OMEGA_GW = 0.01
+const RHO_KIN  = 3.2e33                   # J/m³
+const OMEGA_GW = 0.012
 
 # guesses for the spinning quadrupole emission
 const ETA_F = 1.0
@@ -685,7 +682,8 @@ replaces it with the sound shell model, where the same role is played by
 `(z³/2π²) P̃_gw(z)` with `z = 2π s` — the factor of 2π belongs there and only
 there.
 """
-Pgw(s) = (s)^3 * (7 / (4 + 3(s)^2))^3.5
+const KR_PEAK = 5.0
+Pgw(s) = (x = 2π * s / KR_PEAK; x^3 * (7 / (4 + 3x^2))^3.5)
 
 """
     trapz(x, y)
@@ -837,7 +835,7 @@ Sweep the parameter grid for one sample and reduce the surviving rows to strain
 curves, peaks, characteristic strain and SNR. Returns `nothing` if no row
 survives.
 
-The spectral model is the broken power law [`Pgw`](@ref), with the placeholder
+The spectral model is the broken power law [`Pgw`](@ref), with
 `RHO_KIN` and `OMEGA_GW`; see [`process_eos_pt`](@ref) for the sound shell
 model, where both are replaced by the bubble solution.
 """
