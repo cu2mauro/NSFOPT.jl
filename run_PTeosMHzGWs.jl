@@ -30,7 +30,13 @@
 using Pkg
 Pkg.activate(@__DIR__; io = devnull)
 
-include(joinpath(@__DIR__, "PTeosMHzGWs.jl"))
+using Revise
+
+# Included once per session: a second `include` would build a *new* module, and
+# every name reachable through both copies (`EOSResult`, `Row`, …) would then
+# resolve ambiguously. `includet` tracks the file instead, so edits to the module
+# take effect without re-including it — only changing a `struct` needs a restart.
+isdefined(@__MODULE__, :PTeosMHzGWs) || includet(joinpath(@__DIR__, "PTeosMHzGWs.jl"))
 using .PTeosMHzGWs
 
 using HDF5
