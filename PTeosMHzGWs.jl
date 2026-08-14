@@ -28,7 +28,6 @@ using JSON: parsefile
 using OrdinaryDiffEq: ODEProblem, ContinuousCallback, solve, Vern7, AutoVern7, Rodas5P #maybe consider Vern9?
 using SciMLBase: terminate!, ReturnCode
 using Roots: find_zero, Brent
-using PythonCall
 
 export MonotoneCubic, Linear1D, domain, interp_loglog,
        Branch, load_branch, PTparams, load_PTparams, accepted_ids,
@@ -280,24 +279,40 @@ wavenumbers `z` it is tabulated on, for one EOS and one wall velocity `vw`.
 function PTtools(PT::PTparams, vw)
     alpha = (PT.ePTq - PT.ePTh) / (3 * (PT.ePTh + PT.pPT))
     # css2 is the phase ahead of the wall (hadron), csb2 the one behind (quark).
-    @pyexec (css2=PT.cs2h, csb2=PT.cs2q, alpha=abs(alpha), vw=vw) => """
-        import logging
-        import warnings
-        logging.disable(logging.WARNING)
-        warnings.filterwarnings("ignore")
-        from pttools.bubble import Bubble
-        from pttools.models import ConstCSModel
-        from pttools.ssm import SSMSpectrum
-        model = ConstCSModel(css2=css2, csb2=csb2, alpha_n_min=0.5*alpha, log_info=False)
-        bubble = Bubble(model, v_wall=vw, alpha_n=alpha, theta_bar=True, log_invalid=False)
-        bubble.solve()
-        if bubble.no_solution_found or bubble.solver_failed or bubble.numerical_error:
-            raise RuntimeError(f"no reliable solution at v_wall={vw}, alpha={alpha}")
-        K = float(bubble.kinetic_energy_fraction)
-        spec = SSMSpectrum(bubble)
-        Pgw = spec.spec_den_gw / (3*K**2*spec.source_lifetime_factor)
-        z = spec.y
-        """ => (K::Float64, Pgw::Vector{Float64}, z::Vector{Float64})
+    return Base.invokelatest(_ssm_solver(), PT.cs2h, PT.cs2q, abs(alpha), Float64(vw))
+end
+
+# PythonCall is loaded on first use rather than at module load: importing it runs
+# CondaPkg's resolver, which is slow and prints a dozen lines to stderr, and only
+# `PTtools` needs it. The two `@eval`s must stay separate — the second is
+# macro-expanded only once the first has brought `@pyexec` into scope.
+const _SSM = Ref{Any}()
+
+function _ssm_solver()
+    if !isassigned(_SSM)
+        @eval using PythonCall
+        @eval _SSM[] = function (css2, csb2, alpha, vw)
+            @pyexec (css2, csb2, alpha, vw) => """
+                import logging
+                import warnings
+                logging.disable(logging.WARNING)
+                warnings.filterwarnings("ignore")
+                from pttools.bubble import Bubble
+                from pttools.models import ConstCSModel
+                from pttools.ssm import SSMSpectrum
+                model = ConstCSModel(css2=css2, csb2=csb2, alpha_n_min=0.5*alpha, log_info=False)
+                bubble = Bubble(model, v_wall=vw, alpha_n=alpha, theta_bar=True, log_invalid=False)
+                bubble.solve()
+                if bubble.no_solution_found or bubble.solver_failed or bubble.numerical_error:
+                    raise RuntimeError(f"no reliable solution at v_wall={vw}, alpha={alpha}")
+                K = float(bubble.kinetic_energy_fraction)
+                spec = SSMSpectrum(bubble)
+                Pgw = spec.spec_den_gw / (3*K**2*spec.source_lifetime_factor)
+                z = spec.y
+                """ => (K::Float64, Pgw::Vector{Float64}, z::Vector{Float64})
+        end
+    end
+    return _SSM[]
 end
 
 """
