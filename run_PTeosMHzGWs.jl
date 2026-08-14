@@ -34,8 +34,12 @@ using Revise
 
 # Included once per session: a second `include` would build a *new* module, and
 # every name reachable through both copies (`EOSResult`, `Row`, …) would then
-# resolve ambiguously. `includet` tracks the file instead, so edits to the module
-# take effect without re-including it — only changing a `struct` needs a restart.
+# resolve ambiguously. `includet` tracks the file instead, so edited *functions*
+# take effect at once. Module-level `const`s do not — no `__revise_mode__` setting
+# changes that — so re-tune one in place with
+#     Core.eval(PTeosMHzGWs, :(const OMEGA_GW = 0.02))
+# or restart. `struct`s always need a restart. The constants in *this* file are
+# picked up by re-including it.
 isdefined(@__MODULE__, :PTeosMHzGWs) || includet(joinpath(@__DIR__, "PTeosMHzGWs.jl"))
 using .PTeosMHzGWs
 
