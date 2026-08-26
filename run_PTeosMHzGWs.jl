@@ -172,11 +172,12 @@ function save_results(path::AbstractString, results::Vector{EOSResult},
             f["$g/characteristic"] = r.characteristic
             f["$g/quadrupole"] = r.quadrupole
             f["$g/snr"] = r.snr
-            # 11 × n table, columns in `Row` field order.
+            f["$g/neutrinos"] = r.neutrinos
+            # 12 × n table, columns in `Row` field order.
             f["$g/rows"] = reduce(hcat, [[x.accretion, x.sigma_MeV_fm2, x.Lambda_MeV,
                                           x.v_wall, x.fpeak_MHz, x.R_bubble_m,
                                           x.R_core_m, x.N_bubbles, x.M_at_nucleation,
-                                          x.Λq_at_nucleation, x.Λh_at_nucleation] for x in r.rows])
+                                          x.Λq_at_nucleation, x.Λh_at_nucleation, x.rhoh_at_nucleation] for x in r.rows])
             npt = size(first(r.curves), 1)
             curves = Array{Float64,3}(undef, npt, 2, length(r.curves))
             for (k, c) in pairs(r.curves)
@@ -217,12 +218,12 @@ function load_results(ids; outdir = OUT_DIR)
                 m = read(g["rows"])
                 rows = [Row(m[1, j], m[2, j], m[3, j], m[4, j],
                             m[5, j], m[6, j], m[7, j], m[8, j], 
-                            m[9, j], m[10, j],m[11, j]) for j in axes(m, 2)]
+                            m[9, j], m[10, j],m[11, j], m[12, j]) for j in axes(m, 2)]
                 cs = read(g["curves"])
                 curves = [cs[:, :, k] for k in axes(cs, 3)]
                 push!(results, EOSResult(parse(Int, key), read(g["like"]), rows, curves,
                                          read(g["peaks"]), read(g["characteristic"]),
-                                         read(g["quadrupole"]), read(g["snr"])))
+                                         read(g["quadrupole"]), read(g["snr"]), read(g["neutrinos"])))
                 push!(sources, fid)
             end
         end
@@ -315,10 +316,10 @@ _log_ticks(lims, step) =
 # Likelihoods from the sampler are relative, so they are plotted normalised to
 # the most likely EOS in the set: `like_color` divides by `like_hi`, which puts
 # the scale on 0..1 with the maximum at 1, and the colourbar says so.
-function strain_axes(ylabel, title)
+function strain_axes(ylabel, title; limxs = PLOT_XLIMS, limys = PLOT_YLIMS)
     plot(; xscale = :log10, yscale = :log10,
-         xlims = PLOT_XLIMS, ylims = PLOT_YLIMS,
-         xticks = _log_ticks(PLOT_XLIMS, 1), yticks = _log_ticks(PLOT_YLIMS, 2),
+         xlims = limxs, ylims = limys,
+         xticks = _log_ticks(limxs, 1), yticks = _log_ticks(limys, 2),
          xlabel = L"$f\;\left[\mathrm{Hz}\right]$", ylabel = ylabel,
          framestyle = :box, size = (900, 650), legend = false,
          colorbar = true, clims = (0.0, 1.0),
@@ -337,29 +338,35 @@ denser curve bundles cover the frame drawn with the axes — the edges of the
 plot end up washed with colour instead of a clean black rule. Tracing the box
 again at the end puts it back on top.
 """
-function _frame_on_top!(p)
-    x1, x2 = PLOT_XLIMS
-    y1, y2 = PLOT_YLIMS
+function _frame_on_top!(p; limxs = PLOT_XLIMS, limys = PLOT_YLIMS)
+    x1, x2 = limxs
+    y1, y2 = limys
     plot!(p, [x1, x2, x2, x1, x1], [y1, y1, y2, y2, y1];
           seriestype = :path, linecolor = :black, linewidth = 1.0,
           label = "", primary = false)
     return p
 end
 
+# Dummy series carrying the colour scale, since every real series is drawn in
+# one flat colour and so never defines a colourbar of its own. `colorbar = true`
+# on the axes is not enough on its own: without a series that has a `marker_z`,
+# there is no scale to draw and the panel silently never appears. Every figure
+# that wants the likelihood colourbar has to call this.
+#
+# The points sit *inside* the plot range at zero size: in range so they
+# cannot stretch the axis, zero size so they never show. Do not move them
+# outside the limits to hide them — that expands the axis and squashes the
+# real data, whatever `ylims` says.
+_colorbar_anchor!(p; limxs = PLOT_XLIMS, limys = PLOT_YLIMS) =
+    scatter!(p, fill(limxs[1], 2), fill(limys[1], 2);
+             marker_z = [0.0, 1.0], clims = (0.0, 1.0),
+             c = LIKE_CMAP, markersize = 0, markerstrokewidth = 0, label = "")
+
 function add_noise!(p, noises)
     for nc in noises
         plot!(p, nc.f, nc.asd; color = :gray, linestyle = :dash, label = "")
     end
-    # Dummy series carrying the colour scale, since every real series is drawn in
-    # one flat colour and so never defines a colourbar of its own.
-    #
-    # The points sit *inside* the plot range at zero size: in range so they
-    # cannot stretch the axis, zero size so they never show. Do not move them
-    # outside the limits to hide them — that expands the axis and squashes the
-    # real data, whatever `ylims` says.
-    scatter!(p, fill(PLOT_XLIMS[1], 2), fill(PLOT_YLIMS[1], 2);
-             marker_z = [0.0, 1.0], clims = (0.0, 1.0),
-             c = LIKE_CMAP, markersize = 0, markerstrokewidth = 0, label = "")
+    _colorbar_anchor!(p)
     return _frame_on_top!(p)
 end
 
@@ -387,6 +394,10 @@ _draw_characteristic!(p, r, col; marker = :circle) =
 
 _draw_quadrupole!(p, r, col; marker = :circle) =
     scatter!(p, r.quadrupole[:, 1], r.quadrupole[:, 2]; color = col,
+             markershape = marker, markersize = 2.5, markerstrokewidth = 0, label = "")
+
+_draw_neutrinos!(p, r, col; marker = :circle) =
+    scatter!(p, r.neutrinos[:, 1], r.neutrinos[:, 2]; color = col,
              markershape = marker, markersize = 2.5, markerstrokewidth = 0, label = "")
 
 # One series per EOS, not per curve: an EOS's curves share a colour, so they
@@ -597,6 +608,72 @@ function plot_overlay(datasets, ids;
     _savefig(p, path)
     @info "overlay" datasets = layers files = ids eos = length(results) wrote = joinpath(basename(dir), "$base.$ext")
     return path
+end
+
+# ---------------------------------------------------------------------------
+# NeutrinoBurstPlot: second ν̄ₑ burst of the PT-driven PNS collapse, one point
+# per surviving row, from the linear relations of arXiv:2304.12316
+# ---------------------------------------------------------------------------
+
+function plot_neutrino(ids; outdir = OUT_DIR, figdir = nothing, ext::AbstractString = FIG_EXT)
+    results, like_hi, sources = load_results(ids; outdir)
+    tag = _tag(unique(sources))
+    dir = figdir === nothing ? joinpath(outdir, "figures_$tag") : figdir
+    @info "plotting" files = ids eos = length(results) into = basename(dir)
+    plot_nupeaks(results, like_hi; figdir = dir, ext)
+    return
+end
+
+
+const _TB_LABEL = L"$t_{\mathrm{burst}}\;[\mathrm{s}]$"
+const _LP_LABEL = L"$L_{\bar{\nu}_e,\,\mathrm{peak}}\;\left[10^{53}\,\mathrm{erg\,\, s^{-1}}\right]$"
+# Both observables come out of linear fits and each spans well under a decade,
+# so these axes are linear — unlike `strain_axes`, whose log scales and `f [Hz]`
+# label belong to the strain figures. Limits bracket the supernova models of
+# Table 5 of arXiv:2304.12316, which is all the fits can legitimately produce.
+const NU_XLIMS = (0.5, 2.0)
+const NU_YLIMS = (0.0, 5.0)
+
+function neutrino_axes(title = ""; limxs = NU_XLIMS, limys = NU_YLIMS)
+    plot(; xlims = limxs, ylims = limys,
+         xlabel = _TB_LABEL, ylabel = _LP_LABEL, title = title,
+         framestyle = :box, size = (900, 650), legend = false,
+         colorbar = true, clims = (0.0, 1.0),
+         colorbar_title = L"$\mathrm{Normalized~likelihood}$",
+         colorbar_titlefontsize = 14,
+         right_margin = 6mm, left_margin = 4mm)
+end
+
+function plot_nupeaks(results::Vector{EOSResult}, like_hi::Real;
+                     figdir::AbstractString, ext::AbstractString = FIG_EXT)
+    isempty(results) && error("nothing to plot")
+    mkpath(figdir)
+    ordered = by_z_order(results, like_hi)
+    written = Dict{String,String}()
+
+    function save(p, name)
+        path = joinpath(figdir, name)
+        _savefig(p, path)
+        written[splitext(name)[1]] = path
+        @info "  wrote" figure = joinpath(basename(figdir), name)
+    end
+
+    drawn = sum(r -> count(isfinite, @view r.neutrinos[:, 2]), ordered)
+    drawn == 0 && @warn "no row lands in the fitted band of arXiv:2304.12316" band = PTeosMHzGWs.RHO_COLL_FIT_RANGE
+
+    # `ordered` is palest-first, exactly as the strain figures draw them, so the
+    # highest-likelihood EOS land on top. It matters more here than there: both
+    # observables are linear in the same ρ, so every point of every EOS falls on
+    # one line and they overlap almost completely.
+    let p = neutrino_axes()
+        for r in ordered
+            _draw_neutrinos!(p, r, like_color(r.like, like_hi))
+        end
+        _colorbar_anchor!(p; limxs = NU_XLIMS, limys = NU_YLIMS)
+        save(_frame_on_top!(p; limxs = NU_XLIMS, limys = NU_YLIMS), "neutrinos.$ext")
+    end
+
+    return written
 end
 
 # ---------------------------------------------------------------------------
