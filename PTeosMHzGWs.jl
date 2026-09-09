@@ -57,6 +57,21 @@ const MEV_FM3_TO_RHO14 = MEV_FM3_TO_SI / C_LIGHT^2 / 1e17
 const N_FM3_TO_RHO14   = M_BARYON_MEV * MEV_FM3_TO_RHO14
 const D_SOURCE       = 10 * 3.0857e19     # source distance, m
 
+"""
+Gravitational mass of the accreting star at `t = 0`, M⊙.
+
+The mass→time coordinate `1000 (M - M_SEED)` is anchored here, so `t` is the
+accreted mass in units of 10⁻³ M⊙ and `t / a` is a time in ms. Δp is built from
+*differences* of this coordinate, so the anchor cancels there: moving it leaves
+`dp`, `tguess` and `M_at_nucleation` unchanged and only sets the zero of the
+reported accretion clock (`t0`, and hence `t_accrete_ms`).
+
+Note that criticality is *not* guaranteed to lie above this seed: over the
+current 6516 accepted samples 10.3% cross onto the quark branch below 1.2 M⊙.
+Those get a negative `t_accrete_ms` — see [`Row`](@ref).
+"""
+const M_SEED = 1.2
+
 const RHO_KIN  = 3.2e33                   # J/m³
 const OMEGA_GW = 0.012
 
@@ -349,10 +364,11 @@ end
 Everything stage 2 needs from one EOS sample:
 
 - `dp`: overpressure Δp (GeV⁴) as a function of `t - t₀`, where `t` is the
-  time coordinate `1000 (M - 0.5)` (mass measured in units of accreted M⊙, so
+  time coordinate `1000 (M - M_SEED)` (mass measured in units of accreted M⊙, so
   `t/a` is a time in ms once divided by the accretion rate).
-- `t0`: the offset above, i.e. the time at which the quark branch starts to 
-  diverge from the hadronic one.
+- `t0`: the offset above, i.e. the time at which the quark branch starts to
+  diverge from the hadronic one, measured from `M_SEED`. Negative for a sample
+  whose quark branch already wins below the seed mass.
 - `Rc`: quark-core radius (m) as a function of gravitational mass (M⊙).
 """
 struct PreparedEoS
@@ -392,8 +408,8 @@ function prepare_eos(br::Branch)
     K = min(length(Mi), length(Mxi))
     K ≥ 2 || return nothing
 
-    tQ = 1000 .* (Mi[1:K]  .- 0.5)
-    tH = 1000 .* (Mxi[1:K] .- 0.5)
+    tQ = 1000 .* (Mi[1:K]  .- M_SEED)
+    tH = 1000 .* (Mxi[1:K] .- M_SEED)
 
     pQ = Linear1D(_sorted_unique(tQ, pci[1:K])...)
     pH = Linear1D(_sorted_unique(tH, pcxi[1:K])...)
@@ -402,7 +418,7 @@ function prepare_eos(br::Branch)
     (pos === nothing || pos ≤ 1) && return nothing
     pos -= 1
 
-    t0 = 1000 * (Mi[pos] - 0.5)
+    t0 = 1000 * (Mi[pos] - M_SEED)
     tlo  = max(first(tQ), first(tH))
     tmax = min(last(tQ), last(tH))
     tgrid = filter(t -> tlo ≤ t ≤ tmax, sort!(union(tQ, tH)))
@@ -469,6 +485,18 @@ One point of the parameter sweep and its outcome.
 `N_bubbles == 0` with a zero `fpeak_MHz` means Δp never reached the nucleation
 threshold within the branch; `N_bubbles == -1` flags a numerical failure. Both
 are excluded by the `N_bubbles ≥ 2` cut applied downstream.
+
+The two accretion clocks are both in ms and both assume the constant rate `Ṁ = a`
+that the whole model is built on:
+
+- `t_accrete_ms` — total time from `M = M_SEED` (t = 0) to the transition,
+  i.e. `t0/a + tguess`. **Negative** whenever the sample crosses onto the quark
+  branch below `M_SEED`; that is not a numerical failure but a statement that
+  the star was already supercritical at the seed mass, so the accretion-time
+  interpretation does not apply to it. Filter on `t_accrete_ms ≥ 0` if you need
+  only the samples the seed assumption is valid for.
+- `t_nucleate_ms` — time from criticality to the transition, i.e. `tguess`.
+  Always ≥ 0, and anchor-independent.
 """
 struct Row
     accretion::Float64      # Ṁ, M⊙/s
@@ -483,10 +511,12 @@ struct Row
     Λq_at_nucleation::Float64
     Λh_at_nucleation::Float64
     rhoh_at_nucleation::Float64
+    t_accrete_ms::Float64   # M_SEED -> transition
+    t_nucleate_ms::Float64  # criticality -> transition
 end
 
-_failed(a, s, l, v) = Row(a, s, l, v, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0)
-_never(a, s, l, v)  = Row(a, s, l, v, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+_failed(a, s, l, v) = Row(a, s, l, v, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+_never(a, s, l, v)  = Row(a, s, l, v, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 """
     compute_row(prep, accretion, sigma_MeV_fm2, Lambda_MeV, v_wall) -> Row
@@ -562,14 +592,21 @@ function compute_row(prep::PreparedEoS, accretion::Real, sigma_MeV_fm2::Real,
     fpeak_MHz = cbrt(n_final) / 1000
     R_bubble  = C_LIGHT * 1e-6 / fpeak_MHz
 
-    # Gravitational mass at nucleation.
-    M_at_nucleation = 0.5 + (t0a + tguess) * a / 1000
+    # Accretion clocks (ms), both at the constant rate `a`: from the seed mass
+    # to the transition, and from criticality to the transition. `t_accrete` is
+    # < 0 for a sample already supercritical at M_SEED (see `Row`).
+    t_accrete = t0a + tguess
+    t_nucleate = tguess
+
+    # Gravitational mass at nucleation. Equal to M_crit + tguess*a/1000, so it
+    # is independent of where M_SEED is placed.
+    M_at_nucleation = M_SEED + t_accrete * a / 1000
     R_core = M_at_nucleation < last(domain(Rc)) ? Rc(M_at_nucleation) : 0.0
     Λq_at_nucleation = M_at_nucleation < last(domain(Λq)) ? Λq(M_at_nucleation) : 0.0
     Λh_at_nucleation = M_at_nucleation < last(domain(Λh)) ? Λh(M_at_nucleation) : 0.0
     rhoh_at_nucleation = M_at_nucleation < last(domain(rhoh)) ? rhoh(M_at_nucleation) : 0.0
 
-    return Row(a, sg, lm, v, fpeak_MHz, R_bubble, R_core, (R_core / R_bubble)^3, M_at_nucleation, Λq_at_nucleation, Λh_at_nucleation, rhoh_at_nucleation)
+    return Row(a, sg, lm, v, fpeak_MHz, R_bubble, R_core, (R_core / R_bubble)^3, M_at_nucleation, Λq_at_nucleation, Λh_at_nucleation, rhoh_at_nucleation, t_accrete, t_nucleate)
 end
 
 _ok(sol) = sol.retcode in (ReturnCode.Success, ReturnCode.Terminated)

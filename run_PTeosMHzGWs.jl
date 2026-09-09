@@ -173,11 +173,12 @@ function save_results(path::AbstractString, results::Vector{EOSResult},
             f["$g/quadrupole"] = r.quadrupole
             f["$g/snr"] = r.snr
             f["$g/neutrinos"] = r.neutrinos
-            # 12 × n table, columns in `Row` field order.
+            # 14 × n table, columns in `Row` field order.
             f["$g/rows"] = reduce(hcat, [[x.accretion, x.sigma_MeV_fm2, x.Lambda_MeV,
                                           x.v_wall, x.fpeak_MHz, x.R_bubble_m,
                                           x.R_core_m, x.N_bubbles, x.M_at_nucleation,
-                                          x.Λq_at_nucleation, x.Λh_at_nucleation, x.rhoh_at_nucleation] for x in r.rows])
+                                          x.Λq_at_nucleation, x.Λh_at_nucleation, x.rhoh_at_nucleation,
+                                          x.t_accrete_ms, x.t_nucleate_ms] for x in r.rows])
             npt = size(first(r.curves), 1)
             curves = Array{Float64,3}(undef, npt, 2, length(r.curves))
             for (k, c) in pairs(r.curves)
@@ -208,6 +209,8 @@ function load_results(ids; outdir = OUT_DIR)
     sources = Int[]
     like_hi = 0.0
 
+    legacy = Int[]
+
     for fid in file_ids
         path = results_path(fid; outdir)
         isfile(path) || error("missing $(basename(path)); run `run_sweep($fid)` first")
@@ -216,9 +219,8 @@ function load_results(ids; outdir = OUT_DIR)
             for key in keys(f["eos"])
                 g = f["eos"][key]
                 m = read(g["rows"])
-                rows = [Row(m[1, j], m[2, j], m[3, j], m[4, j],
-                            m[5, j], m[6, j], m[7, j], m[8, j], 
-                            m[9, j], m[10, j],m[11, j], m[12, j]) for j in axes(m, 2)]
+                size(m, 1) < fieldcount(Row) && fid ∉ legacy && push!(legacy, fid)
+                rows = _rows_from_table(m)
                 cs = read(g["curves"])
                 curves = [cs[:, :, k] for k in axes(cs, 3)]
                 push!(results, EOSResult(parse(Int, key), read(g["like"]), rows, curves,
@@ -228,8 +230,27 @@ function load_results(ids; outdir = OUT_DIR)
             end
         end
     end
+    isempty(legacy) || @warn """
+        results file(s) predate the accretion-clock columns; `t_accrete_ms` and \
+        `t_nucleate_ms` read back as NaN. Re-run `run_sweep` on them to fill these in.""" files = legacy
     @info "loaded" files = ids eos = length(results) like_hi
     return results, like_hi, sources
+end
+
+"""
+    _rows_from_table(m) -> Vector{Row}
+
+Rebuild `Row`s from a saved `fieldcount(Row) × n` table.
+
+Files written before `t_accrete_ms`/`t_nucleate_ms` existed carry only the first
+12 columns. The missing ones are filled with `NaN` so old runs still re-plot,
+and so that reading a timing that was never computed shows up as `NaN` rather
+than as a plausible-looking zero.
+"""
+function _rows_from_table(m::AbstractMatrix)
+    nf, ncol = fieldcount(Row), size(m, 1)
+    ncol ≤ nf || error("rows table has $ncol columns, more than the $nf fields of `Row`")
+    return [Row(ntuple(k -> k ≤ ncol ? Float64(m[k, j]) : NaN, nf)...) for j in axes(m, 2)]
 end
 
 function _resolve_ids(ids, outdir)
@@ -736,8 +757,8 @@ accepted list, not the sample id.
 This re-sweeps on its own denser grid, so it does not use the saved results.
 """
 function plot_bubbles(h5_id::Integer, index::Integer;
-                      accretions = 0.1:0.1:0.9, sigmas = 10.0:5.0:40.0,
-                      lambdas = LAMBDAS, vs = 0.01:0.01:0.5,
+                      accretions = 0.1:0.2:1.0, sigmas = 10.0:10.0:50.0,
+                      lambdas = LAMBDAS, vs = 0.005:0.01:0.3,
                       datadir = DATA_DIR, figdir = nothing, outdir = OUT_DIR,
                       ext::AbstractString = FIG_EXT)
     h5path = joinpath(datadir, "$h5_id.h5")
@@ -835,6 +856,68 @@ function plot_bubbles(h5_id::Integer, index::Integer;
             rm_hi, minimum(r.fpeak_MHz for r in hf))
     @info "  wrote" figure = joinpath(basename(dir), basename(path))
     return
+end
+
+"""
+    export_bubbles(h5_id, index; path = nothing, kwargs...)
+
+Write the rows that `plot_bubbles(h5_id, index)` would plot to an HDF5 file, so
+the matplotlib notebook can redraw the figure without re-running the sweep.
+
+Same dense grid and same surviving cut as `plot_bubbles` (`N_bubbles ≥ 2` and
+`fpeak_MHz ≥ 1e-4`), so the exported points are exactly the plotted ones. The
+file holds one 1D dataset per plotted quantity plus a `meta` group:
+
+    accretion       Ṁ    [M⊙/s]     (X axis)
+    sigma_MeV_fm2   σ    [MeV/fm²]   (Y axis)
+    v_wall          v_w/c            (Z axis)
+    N_bubbles                        (colour)
+    R_bubble_m      bubble radius    (marker size)
+    fpeak_MHz       peak frequency   (size-legend annotation)
+    meta/id, meta/h5_id, meta/Lambda_MeV
+
+`path` defaults to `figures_<h5_id>/bubbles_<id>.h5` under `OUT_DIR`, next to the
+Julia figure. Pass `path` to write straight into the paper's data directory.
+"""
+function export_bubbles(h5_id::Integer, index::Integer;
+                        accretions = 0.1:0.2:1.0, sigmas = 10.0:10.0:50.0,
+                        lambdas = LAMBDAS, vs = 0.005:0.01:0.3,
+                        datadir = DATA_DIR, outdir = OUT_DIR, path = nothing)
+    # `vs` is deliberately coarser than `plot_bubbles` (10 wall velocities, not
+    # 50): the matplotlib figure is uncluttered along v_w. Widen it here if the
+    # exploratory Julia plot showed structure a coarse grid would miss.
+    h5path = joinpath(datadir, "$h5_id.h5")
+    accepted = accepted_ids(joinpath(datadir, "accepted.json"), "$h5_id.h5")
+    1 ≤ index ≤ length(accepted) ||
+        error("index $index out of range (file $h5_id.h5 has $(length(accepted)) accepted samples)")
+    id = accepted[index]
+
+    prep = prepare_eos(h5open(f -> load_branch(f, id), h5path, "r"))
+    prep === nothing && error("prepare_eos failed for sample $id of $h5_id.h5")
+
+    rows = sweep(prep, accretions, sigmas, lambdas, vs)
+    hf = filter(r -> r.N_bubbles ≥ 2 && r.fpeak_MHz ≥ 0.0001, rows)
+    isempty(hf) && error("no surviving rows for sample $id of $h5_id.h5")
+
+    dest = path === nothing ? joinpath(outdir, "figures_$h5_id", "bubbles_$id.h5") : path
+    mkpath(dirname(dest))
+    h5open(dest, "w") do f
+        f["accretion"]     = [r.accretion for r in hf]
+        f["sigma_MeV_fm2"] = [r.sigma_MeV_fm2 for r in hf]
+        f["v_wall"]        = [r.v_wall for r in hf]
+        f["N_bubbles"]     = [r.N_bubbles for r in hf]
+        f["R_bubble_m"]    = [r.R_bubble_m for r in hf]
+        f["fpeak_MHz"]     = [r.fpeak_MHz for r in hf]
+        f["meta/id"]         = id
+        f["meta/h5_id"]      = Int(h5_id)
+        f["meta/Lambda_MeV"] = collect(float.(lambdas))
+    end
+
+    rm = [r.R_bubble_m for r in hf]
+    @info "exported bubble data" file = "$h5_id.h5" sample = id plotted = length(hf) to = dest
+    @printf("  Rmin : %.4g m   Rmax : %.4g m   (%d points)\n",
+            minimum(rm), maximum(rm), length(hf))
+    return dest
 end
 
 # ---------------------------------------------------------------------------

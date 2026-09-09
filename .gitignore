@@ -1,1 +1,4 @@
 .CondaPkg/
+results/
+settings.local.json
+.claude/
