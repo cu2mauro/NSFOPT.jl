@@ -65,7 +65,6 @@ const OUT_DIR  = joinpath(@__DIR__, "results")
 const ACCRETIONS = 0.2:0.2:1.0     # Ṁ, M⊙/s, linear stage past criticality
 const SIGMAS     = 10.0:10.0:50.0   # surface tension, MeV/fm²
 const LAMBDAS    = [200.0]          # energy scale, MeV
-const VS_OLD     = 0.01:0.02:0.07   # wall velocity / c
 const VS         = [0.01, 0.02, 0.03, 0.05, 0.07, 0.10, 0.15, 0.20, 0.30, 0.45, 0.65]
 
 # ColorDatas. Low likelihood → pale, high → dark, so the interesting EOS stand
@@ -172,12 +171,11 @@ function save_results(path::AbstractString, results::Vector{EOSResult},
             f["$g/characteristic"] = r.characteristic
             f["$g/quadrupole"] = r.quadrupole
             f["$g/snr"] = r.snr
-            f["$g/neutrinos"] = r.neutrinos
-            # 13 × n table, columns in `Row` field order.
+            # 12 × n table, columns in `Row` field order.
             f["$g/rows"] = reduce(hcat, [[x.accretion, x.sigma_MeV_fm2, x.Lambda_MeV,
                                           x.v_wall, x.fpeak_MHz, x.R_bubble_m,
                                           x.R_core_m, x.N_bubbles, x.M_nuc,
-                                          x.Λq_nuc, x.Λh_nuc, x.rhoh_nuc,
+                                          x.Λq_nuc, x.Λh_nuc,
                                           x.t_nuc_ms] for x in r.rows])
             npt = size(first(r.curves), 1)
             curves = Array{Float64,3}(undef, npt, 2, length(r.curves))
@@ -225,7 +223,7 @@ function load_results(ids; outdir = OUT_DIR)
                 curves = [cs[:, :, k] for k in axes(cs, 3)]
                 push!(results, EOSResult(parse(Int, key), read(g["like"]), rows, curves,
                                          read(g["peaks"]), read(g["characteristic"]),
-                                         read(g["quadrupole"]), read(g["snr"]), read(g["neutrinos"])))
+                                         read(g["quadrupole"]), read(g["snr"])))
                 push!(sources, fid)
             end
         end
@@ -244,9 +242,12 @@ Rebuild `Row`s from a saved `fieldcount(Row) × n` table.
 
 Short tables are padded with `NaN` so older runs still re-plot, and so that
 reading a quantity that was never computed shows up as `NaN` rather than as a
-plausible-looking zero. Tables written before the two accretion clocks collapsed
-into the single `t_nuc_ms` have 14 columns and are rejected outright: their
-timings mean something different, so they have to be re-swept.
+plausible-looking zero. Only *appended* columns are safe to pad for, which is
+why a table with more columns than `Row` has fields is rejected outright rather
+than truncated — a column dropped from the middle would otherwise shift every
+later quantity into the wrong field. Tables written while `Row` still carried
+`rhoh_nuc` (13 columns) or the two separate accretion clocks (14) are rejected
+on that rule and have to be re-swept.
 """
 function _rows_from_table(m::AbstractMatrix)
     nf, ncol = fieldcount(Row), size(m, 1)
@@ -338,11 +339,15 @@ _log_ticks(lims, step) =
 # Likelihoods from the sampler are relative, so they are plotted normalised to
 # the most likely EOS in the set: `like_color` divides by `like_hi`, which puts
 # the scale on 0..1 with the maximum at 1, and the colourbar says so.
-function strain_axes(ylabel, title; limxs = PLOT_XLIMS, limys = PLOT_YLIMS)
+#
+# `title` defaults to none: the figures that go in the paper are captioned there,
+# and at print size a title only eats height. The diagnostic plots
+# (`plot_pt`, `plot_compare`) pass one because they are read on screen.
+function strain_axes(ylabel, title = ""; limxs = PLOT_XLIMS, limys = PLOT_YLIMS)
     plot(; xscale = :log10, yscale = :log10,
          xlims = limxs, ylims = limys,
          xticks = _log_ticks(limxs, 1), yticks = _log_ticks(limys, 2),
-         xlabel = L"$f\;\left[\mathrm{Hz}\right]$", ylabel = ylabel,
+         xlabel = L"$f\;\left[\mathrm{Hz}\right]$", ylabel = ylabel, title = title,
          framestyle = :box, size = (900, 650), legend = false,
          colorbar = true, clims = (0.0, 1.0),
          colorbar_title = L"$\mathrm{Normalized~likelihood}$",
@@ -355,10 +360,10 @@ end
 
 Re-draw the axis box as the last series.
 
-Series are painted in the order they are added, so the envelope fills and the
-denser curve bundles cover the frame drawn with the axes — the edges of the
-plot end up washed with colour instead of a clean black rule. Tracing the box
-again at the end puts it back on top.
+Series are painted in the order they are added, so the denser curve bundles
+cover the frame drawn with the axes — the edges of the plot end up washed with
+colour instead of a clean black rule. Tracing the box again at the end puts it
+back on top.
 """
 function _frame_on_top!(p; limxs = PLOT_XLIMS, limys = PLOT_YLIMS)
     x1, x2 = limxs
@@ -369,16 +374,13 @@ function _frame_on_top!(p; limxs = PLOT_XLIMS, limys = PLOT_YLIMS)
     return p
 end
 
-# Dummy series carrying the colour scale, since every real series is drawn in
-# one flat colour and so never defines a colourbar of its own. `colorbar = true`
-# on the axes is not enough on its own: without a series that has a `marker_z`,
-# there is no scale to draw and the panel silently never appears. Every figure
-# that wants the likelihood colourbar has to call this.
+# Dummy series carrying the colour scale: every real series is one flat colour, so
+# none defines a colourbar, and `colorbar = true` alone draws nothing without a
+# series that has a `marker_z`. Every figure wanting the likelihood bar calls this.
 #
-# The points sit *inside* the plot range at zero size: in range so they
-# cannot stretch the axis, zero size so they never show. Do not move them
-# outside the limits to hide them — that expands the axis and squashes the
-# real data, whatever `ylims` says.
+# The points sit *inside* the plot range at zero size. Do not move them outside
+# the limits to hide them — that expands the axis and squashes the real data,
+# whatever `ylims` says.
 _colorbar_anchor!(p; limxs = PLOT_XLIMS, limys = PLOT_YLIMS) =
     scatter!(p, fill(limxs[1], 2), fill(limys[1], 2);
              marker_z = [0.0, 1.0], clims = (0.0, 1.0),
@@ -396,10 +398,8 @@ end
 # Dataset layers
 #
 # Every strain dataset lives on the same log-log axes, so each reduces to a
-# `draw!(p, r, col)` that adds one EOS's contribution to an existing plot. The
-# standalone figures (`plot_strain`) and the combined overlay (`plot_overlay`)
-# both go through these, so a style lives in one place — and this is the surface
-# to port if the backend ever moves to CairoMakie.
+# `draw!(p, r, col)` that adds one EOS's contribution to an existing plot. Both
+# `plot_strain` and `plot_overlay` go through these, so a style lives in one place.
 # ---------------------------------------------------------------------------
 
 const _SH_LABEL  = L"$\sqrt{S_h}\;\left[\mathrm{Hz}^{-1/2}\right]$"
@@ -418,10 +418,6 @@ _draw_quadrupole!(p, r, col; marker = :circle) =
     scatter!(p, r.quadrupole[:, 1], r.quadrupole[:, 2]; color = col,
              markershape = marker, markersize = 2.5, markerstrokewidth = 0, label = "")
 
-_draw_neutrinos!(p, r, col; marker = :circle) =
-    scatter!(p, r.neutrinos[:, 1], r.neutrinos[:, 2]; color = col,
-             markershape = marker, markersize = 2.5, markerstrokewidth = 0, label = "")
-
 # One series per EOS, not per curve: an EOS's curves share a colour, so they
 # string into a single polyline with NaN between them (a NaN lifts the pen).
 # Plots' per-series overhead dominates at tens of thousands of curves, and the
@@ -436,18 +432,11 @@ function _draw_curves!(p, r, col; marker = :none)
     plot!(p, xs, ys; color = col, linewidth = 0.5, label = "")
 end
 
-function _draw_envelopes!(p, r, col; marker = :none)
-    f, upper, lower = envelope(r.curves)
-    plot!(p, f, upper; fillrange = lower, fillalpha = 0.7,
-          fillcolor = col, linecolor = col, linewidth = 0.3, label = "")
-end
-
-# Ordered back-to-front: fills, then curve bundles, then point clouds, so a
-# scatter dataset always lands on top of an envelope it shares a figure with.
-# `kind` picks the y-axis label; `marker` tells the point datasets apart when
-# several are overlaid (ignored by curves/envelopes).
+# Ordered back-to-front: curve bundles, then point clouds, so a scatter dataset
+# always lands on top of the curves it shares a figure with. `kind` picks the
+# y-axis label; `marker` tells the point datasets apart when several are
+# overlaid (ignored by curves).
 const STRAIN_LAYERS = (
-    envelopes      = (draw = _draw_envelopes!,      kind = :sh, marker = :none),
     curves         = (draw = _draw_curves!,         kind = :sh, marker = :none),
     characteristic = (draw = _draw_characteristic!, kind = :hc, marker = :diamond),
     quadrupole     = (draw = _draw_quadrupole!,     kind = :hc, marker = :utriangle),
@@ -459,12 +448,12 @@ _layer_label(kind) = kind === :sh ? _SH_LABEL : kind === :hc ? _HC_LABEL : _GEN_
 """
     _parse_layers(datasets) -> Vector{Symbol}
 
-Normalise a dataset selection — a string like `"peaks, envelopes"`, or an
+Normalise a dataset selection — a string like `"peaks, curves"`, or an
 iterable of strings/symbols — to validated layer names.
 """
 function _parse_layers(datasets)
     raw = datasets isa AbstractString ? split(datasets, r"[\s,]+"; keepempty = false) :
-          datasets isa Union{AbstractString,Symbol} ? [datasets] : collect(datasets)
+          datasets isa Symbol ? [datasets] : collect(datasets)
     names = Symbol[Symbol(lowercase(string(x))) for x in raw]
     isempty(names) && error("no datasets given")
     valid = keys(STRAIN_LAYERS)
@@ -481,8 +470,8 @@ end
 """
     plot_strain(results, like_hi; figdir, noises) -> Dict{String,String}
 
-Write the four strain figures (peaks, curves, characteristic, envelopes) for a
-collection of results, however many source files it spans.
+Write the three strain figures (peaks, curves, characteristic) for a collection
+of results, however many source files it spans.
 """
 function plot_strain(results::Vector{EOSResult}, like_hi::Real;
                      figdir::AbstractString, noises = noise_curves(),
@@ -499,34 +488,27 @@ function plot_strain(results::Vector{EOSResult}, like_hi::Real;
         @info "  wrote" figure = joinpath(basename(figdir), name)
     end
 
-    let p = strain_axes(_SH_LABEL, "Peaks")
+    let p = strain_axes(_SH_LABEL)
         for r in ordered
             _draw_peaks!(p, r, like_color(r.like, like_hi))
         end
         save(add_noise!(p, noises), "peaks.$ext")
     end
 
-    let p = strain_axes(_SH_LABEL, "Curves")
+    let p = strain_axes(_SH_LABEL)
         for r in ordered
             _draw_curves!(p, r, like_color(r.like, like_hi))
         end
         save(add_noise!(p, noises), "curves.$ext")
     end
 
-    let p = strain_axes(_HC_LABEL, "Characteristic")
+    let p = strain_axes(_HC_LABEL)
         for r in ordered
             col = like_color(r.like, like_hi)
             _draw_characteristic!(p, r, col)
             _draw_quadrupole!(p, r, col)
         end
         save(add_noise!(p, noises), "characteristic.$ext")
-    end
-
-    let p = strain_axes(_SH_LABEL, "Envelopes")
-        for r in ordered
-            _draw_envelopes!(p, r, like_color(r.like, like_hi))
-        end
-        save(add_noise!(p, noises), "envelopes.$ext")
     end
 
     return written
@@ -565,10 +547,7 @@ function _overlay_legend!(p, layers)
     for name in keys(STRAIN_LAYERS)
         name in layers || continue
         L = STRAIN_LAYERS[name]
-        if name === :envelopes
-            plot!(p, [NaN, NaN], [NaN, NaN]; seriestype = :shape,
-                  fillcolor = :gray, fillalpha = 0.5, linecolor = :gray, label = string(name))
-        elseif L.marker === :none
+        if L.marker === :none
             plot!(p, [NaN, NaN], [NaN, NaN]; color = :gray, linewidth = 1.5, label = string(name))
         else
             scatter!(p, [NaN], [NaN]; markershape = L.marker, color = :gray,
@@ -584,11 +563,11 @@ end
 
 Overlay several strain datasets on one figure for the given result ids.
 
-`datasets` selects the layers: a string like `"peaks, envelopes"`, or a vector
-`["peaks", "envelopes", "quadrupole"]`. `ids` is as in [`plot_ids`](@ref) — an
+`datasets` selects the layers: a string like `"peaks, curves"`, or a vector
+`["peaks", "curves", "quadrupole"]`. `ids` is as in [`plot_ids`](@ref) — an
 integer, an iterable (`0:2`), or `:all`. Available layers: $(join(keys(STRAIN_LAYERS), ", ")).
 
-Layers draw back-to-front (envelopes, curves, then point clouds), each in
+Layers draw back-to-front (curves, then point clouds), each in
 likelihood order, so the highest-likelihood EOS sit on top. Point datasets get
 distinct marker shapes; colour encodes likelihood throughout. A gray key naming
 each layer is drawn unless `legend = false`.
@@ -630,72 +609,6 @@ function plot_overlay(datasets, ids;
     _savefig(p, path)
     @info "overlay" datasets = layers files = ids eos = length(results) wrote = joinpath(basename(dir), "$base.$ext")
     return path
-end
-
-# ---------------------------------------------------------------------------
-# NeutrinoBurstPlot: second ν̄ₑ burst of the PT-driven PNS collapse, one point
-# per surviving row, from the linear relations of arXiv:2304.12316
-# ---------------------------------------------------------------------------
-
-function plot_neutrino(ids; outdir = OUT_DIR, figdir = nothing, ext::AbstractString = FIG_EXT)
-    results, like_hi, sources = load_results(ids; outdir)
-    tag = _tag(unique(sources))
-    dir = figdir === nothing ? joinpath(outdir, "figures_$tag") : figdir
-    @info "plotting" files = ids eos = length(results) into = basename(dir)
-    plot_nupeaks(results, like_hi; figdir = dir, ext)
-    return
-end
-
-
-const _TB_LABEL = L"$t_{\mathrm{burst}}\;[\mathrm{s}]$"
-const _LP_LABEL = L"$L_{\bar{\nu}_e,\,\mathrm{peak}}\;\left[10^{53}\,\mathrm{erg\,\, s^{-1}}\right]$"
-# Both observables come out of linear fits and each spans well under a decade,
-# so these axes are linear — unlike `strain_axes`, whose log scales and `f [Hz]`
-# label belong to the strain figures. Limits bracket the supernova models of
-# Table 5 of arXiv:2304.12316, which is all the fits can legitimately produce.
-const NU_XLIMS = (0.5, 2.0)
-const NU_YLIMS = (0.0, 5.0)
-
-function neutrino_axes(title = ""; limxs = NU_XLIMS, limys = NU_YLIMS)
-    plot(; xlims = limxs, ylims = limys,
-         xlabel = _TB_LABEL, ylabel = _LP_LABEL, title = title,
-         framestyle = :box, size = (900, 650), legend = false,
-         colorbar = true, clims = (0.0, 1.0),
-         colorbar_title = L"$\mathrm{Normalized~likelihood}$",
-         colorbar_titlefontsize = 14,
-         right_margin = 6mm, left_margin = 4mm)
-end
-
-function plot_nupeaks(results::Vector{EOSResult}, like_hi::Real;
-                     figdir::AbstractString, ext::AbstractString = FIG_EXT)
-    isempty(results) && error("nothing to plot")
-    mkpath(figdir)
-    ordered = by_z_order(results, like_hi)
-    written = Dict{String,String}()
-
-    function save(p, name)
-        path = joinpath(figdir, name)
-        _savefig(p, path)
-        written[splitext(name)[1]] = path
-        @info "  wrote" figure = joinpath(basename(figdir), name)
-    end
-
-    drawn = sum(r -> count(isfinite, @view r.neutrinos[:, 2]), ordered)
-    drawn == 0 && @warn "no row lands in the fitted band of arXiv:2304.12316" band = PTeosMHzGWs.RHO_COLL_FIT_RANGE
-
-    # `ordered` is palest-first, exactly as the strain figures draw them, so the
-    # highest-likelihood EOS land on top. It matters more here than there: both
-    # observables are linear in the same ρ, so every point of every EOS falls on
-    # one line and they overlap almost completely.
-    let p = neutrino_axes()
-        for r in ordered
-            _draw_neutrinos!(p, r, like_color(r.like, like_hi))
-        end
-        _colorbar_anchor!(p; limxs = NU_XLIMS, limys = NU_YLIMS)
-        save(_frame_on_top!(p; limxs = NU_XLIMS, limys = NU_YLIMS), "neutrinos.$ext")
-    end
-
-    return written
 end
 
 # ---------------------------------------------------------------------------

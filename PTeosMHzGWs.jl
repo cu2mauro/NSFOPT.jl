@@ -35,7 +35,7 @@ export MonotoneCubic, Linear1D, domain, interp_loglog,
        PreparedEoS, prepare_eos,
        Row, compute_row, safe_row, sweep,
        NoiseCurve, load_noise_curve, Pgw, trapz, geometric_prefactor,
-       EOSResult, process_eos, process_eos_pt, envelope, PTtools
+       EOSResult, process_eos, process_eos_pt, PTtools
 
 # ---------------------------------------------------------------------------
 # Physical constants and pipeline settings
@@ -47,15 +47,6 @@ const MEV_FM3_TO_SI  = 1.602176634e32     # 1 MeV/fm³ in J/m³
 const G_NEWTON       = 6.6743e-11         # SI
 const C_LIGHT        = 299792458.0        # SI
 
-# Rest-mass density ρ = m_B n_B, in the convention of arXiv:2304.12316: that
-# paper's AGILE-BOLTZTRAN runs assume m_B = 938 MeV (not the sampler's own
-# 931.494 MeV), and its fits Eq. (3)/(5) take ρ in 10¹⁴ g cm⁻³, so n_B [fm⁻³]
-# has to be turned into a *mass* density — hence the factor 1/c².
-const M_BARYON_MEV     = 938.0
-"1 MeV/fm³ as a mass density in 10¹⁴ g cm⁻³ (J/m³ → kg/m³ → g/cm³ → 10¹⁴)."
-const MEV_FM3_TO_RHO14 = MEV_FM3_TO_SI / C_LIGHT^2 / 1e17
-"n_B [fm⁻³] → ρ [10¹⁴ g cm⁻³]; ≈ 16.72, so n_sat = 0.16 fm⁻³ ↦ 2.7."
-const N_FM3_TO_RHO14   = M_BARYON_MEV * MEV_FM3_TO_RHO14
 const D_SOURCE       = 10 * 3.0857e19     # source distance, m
 
 """
@@ -101,8 +92,27 @@ const SPIN = 0.2
 
 "Upper frequency limit of the plotted/integrated band, Hz."
 const F_HI = 5.0e7
-"Points per plotted strain curve."
-const N_F_CURVE = 60
+"Intervals per strain curve as stored and plotted, so `N_F_CURVE + 1` points."
+const N_F_CURVE = 20
+
+"""
+    N_F_CHAR_REFINE
+
+How much finer than the stored curve the characteristic-strain integral is done.
+
+[`_reduce`](@ref) evaluates the spectrum on a grid `N_F_CHAR_REFINE`× denser
+than the curve it keeps, and takes every `N_F_CHAR_REFINE`-th node as that
+curve. Plot resolution and integral accuracy are then independent: `N_F_CURVE`
+can be lowered to thin the figures without moving `f_c`, since the integral only
+ever sees the product `N_F_CURVE * N_F_CHAR_REFINE`.
+
+That product matters. Where `R_bubble` is small enough that the spectrum is
+still rising at `F_HI`, the integral is dominated by its top edge and converges
+slowly: at 60 intervals `f_c` is ~0.7% off its converged value, at 24 nearly 4%.
+Keep the product at 60 or above.
+"""
+const N_F_CHAR_REFINE = 3
+
 "Points per SNR integral."
 const N_F_SNR = 200
 
@@ -255,7 +265,6 @@ struct Branch
     pcx::Vector{Float64}
     stabx::Vector{Float64}
     Λtdx::Vector{Float64}
-    nx::Vector{Float64}
     like::Float64
 end
 
@@ -277,7 +286,6 @@ function load_branch(f, id::Integer)
         read(f, "$g/TOVext/p_cent"),
         read(f, "$g/TOVext/stab"),
         read(f, "$g/TOVext/Lambda"),
-        read(f, "$g/TOVext/n_cent"),
         first(read(f, "$g/params/ptot")),
     )
 end
@@ -391,6 +399,8 @@ Everything stage 2 needs from one EOS sample:
 - `t_crit`: time from core collapse to `M_crit` under [`M_fallback`](@ref), ms.
   Fixed by the EOS, not by the sweep grid, hence computed once here.
 - `Rc`: quark-core radius (m) as a function of gravitational mass (M⊙).
+- `Λq`, `Λh`: tidal deformability of the quark and hadronic branch against
+  gravitational mass (M⊙); both feed the spinning-quadrupole strain.
 """
 struct PreparedEoS
     dp::MonotoneCubic
@@ -399,7 +409,6 @@ struct PreparedEoS
     Rc::MonotoneCubic
     Λq::MonotoneCubic
     Λh::MonotoneCubic
-    rhoh::MonotoneCubic
 end
 
 """
@@ -426,7 +435,6 @@ function prepare_eos(br::Branch)
     Rqmi = br.Rqm[stab_idx] .* 1000
     Lambda = br.Λtd[stab_idx]
     Lamdbax = br.Λtdx[stab_idxx]
-    rhox = br.nx[stab_idxx] .* N_FM3_TO_RHO14
 
     K = min(length(Mi), length(Mxi))
     K ≥ 2 || return nothing
@@ -471,12 +479,7 @@ function prepare_eos(br::Branch)
     length(mx) ≥ 2 || return nothing
     Λh = MonotoneCubic(mx, my)
 
-    # nh(M) over the hadronic branch.
-    mx, my = _sorted_unique(Mxi, rhox)
-    length(mx) ≥ 2 || return nothing
-    rhoh = MonotoneCubic(mx, my)
-
-    return PreparedEoS(dp, M_crit, t_crit, Rc, Λq, Λh, rhoh)
+    return PreparedEoS(dp, M_crit, t_crit, Rc, Λq, Λh)
 end
 
 _chop(v::Float64) = abs(v) < CHOP_TOL ? 0.0 : v
@@ -533,12 +536,11 @@ struct Row
     M_nuc::Float64          # gravitational mass at nucleation, M⊙
     Λq_nuc::Float64
     Λh_nuc::Float64
-    rhoh_nuc::Float64
     t_nuc_ms::Float64       # core collapse -> nucleation
 end
 
-_failed(a, s, l, v) = Row(a, s, l, v, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-_never(a, s, l, v)  = Row(a, s, l, v, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+_failed(a, s, l, v) = Row(a, s, l, v, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0)
+_never(a, s, l, v)  = Row(a, s, l, v, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 """
     compute_row(prep, accretion, sigma_MeV_fm2, Lambda_MeV, v_wall) -> Row
@@ -557,7 +559,7 @@ function compute_row(prep::PreparedEoS, accretion::Real, sigma_MeV_fm2::Real,
     lm = Float64(Lambda_MeV)
     v  = Float64(v_wall)
 
-    dp, Rc, Λq, Λh, rhoh = prep.dp, prep.Rc, prep.Λq, prep.Λh, prep.rhoh
+    dp, Rc, Λq, Λh = prep.dp, prep.Rc, prep.Λq, prep.Λh
     M_crit, t_crit = prep.M_crit, prep.t_crit
 
     σ = sg / GEV_TO_INVFM^2 / 1000
@@ -623,13 +625,12 @@ function compute_row(prep::PreparedEoS, accretion::Real, sigma_MeV_fm2::Real,
     t_nuc = t_crit + τ_nuc
     M_nuc = M_crit + τ_nuc * a / 1000
 
-    R_core   = M_nuc < last(domain(Rc))   ? Rc(M_nuc)   : 0.0
-    Λq_nuc   = M_nuc < last(domain(Λq))   ? Λq(M_nuc)   : 0.0
-    Λh_nuc   = M_nuc < last(domain(Λh))   ? Λh(M_nuc)   : 0.0
-    rhoh_nuc = M_nuc < last(domain(rhoh)) ? rhoh(M_nuc) : 0.0
+    R_core = M_nuc < last(domain(Rc)) ? Rc(M_nuc) : 0.0
+    Λq_nuc = M_nuc < last(domain(Λq)) ? Λq(M_nuc) : 0.0
+    Λh_nuc = M_nuc < last(domain(Λh)) ? Λh(M_nuc) : 0.0
 
     return Row(a, sg, lm, v, fpeak_MHz, R_bubble, R_core, (R_core / R_bubble)^3,
-               M_nuc, Λq_nuc, Λh_nuc, rhoh_nuc, t_nuc)
+               M_nuc, Λq_nuc, Λh_nuc, t_nuc)
 end
 
 _ok(sol) = sol.retcode in (ReturnCode.Success, ReturnCode.Terminated)
@@ -765,59 +766,6 @@ function hcf_quad(M::Float64, Λq::Float64, Λh::Float64)
 end
 
 # ---------------------------------------------------------------------------
-# Stage 2.2: second antineutrino burst
-# ---------------------------------------------------------------------------
-
-"""
-    RHO_COLL_FIT_RANGE
-
-Range of ρ_collapse spanned by the supernova models that Eqs. (3) and (5) of
-arXiv:2304.12316 were fitted to, in 10¹⁴ g cm⁻³ (Table 4/5 of that paper give
-4.2–6.3; the text quotes 4.2–6.2). Both relations are *empirical* linear fits
-over that band and nothing else — Eq. (5) in particular has a negative slope,
-so extrapolating past ρ = d₃ = 5.890 returns a negative luminosity.
-"""
-const RHO_COLL_FIT_RANGE = (2, 8)
-
-"""
-    tL_burst(ρ_coll) -> [t_burst, L_peak]
-
-Second (electron antineutrino) burst of a PNS collapse triggered by the quark
-matter phase transition, from the linear relations of arXiv:2304.12316:
-
-    ρ_collapse ≃ c₁ t_burst      + d₁    (Eq. 3)
-    ρ_collapse ≃ c₃ L_ν̄e,peak    + d₃    (Eq. 5)
-
-inverted for the observables. `ρ_coll` is the *rest-mass* density ρ = m_B n_B
-at the onset of collapse in **10¹⁴ g cm⁻³** (see [`N_FM3_TO_RHO14`](@ref)),
-`t_burst` is the post-bounce time in s and `L_peak` the peak ν̄ₑ luminosity in
-10⁵³ erg s⁻¹. Outside [`RHO_COLL_FIT_RANGE`](@ref) both are `NaN`: the fits
-carry no information there, and this also swallows the `0.0` that
-[`compute_row`](@ref) writes when the nucleation mass falls off the branch.
-`L_peak` alone is `NaN` for ρ > d₃ = 5.890, where Eq. (5) has already gone
-negative while Eq. (3) is still inside its fitted band.
-"""
-function tL_burst(ρ_coll::Float64)
-
-    cdt = [1.304, 3.922]
-    cdL = [-0.172, 5.890]
-
-    lo, hi = RHO_COLL_FIT_RANGE
-    (isfinite(ρ_coll) && lo ≤ ρ_coll ≤ hi) || return [NaN, NaN]
-
-    t_b = (ρ_coll-cdt[2]) / cdt[1]
-    L_peak = (ρ_coll-cdL[2]) / cdL[1]
-
-    # The two fits are independent, so their implied ρ ranges do not quite
-    # agree: Eq. (5) crosses zero at ρ = d₃ = 5.890, inside the band Eq. (3)
-    # still covers. A negative peak luminosity is meaningless, so drop it and
-    # keep the (much tighter) timing relation.
-    L_peak > 0 || (L_peak = NaN)
-
-    return [t_b::Float64, L_peak::Float64]
-end
-
-# ---------------------------------------------------------------------------
 # Stage 3: strain spectra and SNR
 # ---------------------------------------------------------------------------
 
@@ -907,7 +855,6 @@ struct EOSResult
     characteristic::Matrix{Float64}
     quadrupole::Matrix{Float64}
     snr::Vector{Float64}
-    neutrinos::Matrix{Float64}
 end
 
 """
@@ -921,31 +868,37 @@ geometric_prefactor(r::Row) =
     r.R_core_m^3 / D_SOURCE^2 * 128π * G_NEWTON^2 / C_LIGHT^9 * r.R_bubble_m^4
 
 """
-    _reduce(id, like, keep, noise, Sh; f_hi, n_curve, n_snr) -> EOSResult
+    _reduce(id, like, keep, noise, Sh; f_hi, n_curve, n_snr, refine) -> EOSResult
 
 Turn surviving rows into curves, peaks, characteristic strain and SNR.
 
 `Sh(k, f)` gives the strain spectral density of row `keep[k]` at frequency `f`;
 it is the only thing that differs between the spectral models, so both
 [`process_eos`](@ref) and [`process_eos_pt`](@ref) reduce through here.
+
+The characteristic-strain integral runs on a grid `refine`× finer than the
+stored curve, which is every `refine`-th node of it — see
+[`N_F_CHAR_REFINE`](@ref).
 """
 function _reduce(id::Integer, like::Real, keep::Vector{Row}, noise::NoiseCurve,
-                 Sh::Function; f_hi::Real, n_curve::Integer, n_snr::Integer)
+                 Sh::Function; f_hi::Real, n_curve::Integer, n_snr::Integer,
+                 refine::Integer = N_F_CHAR_REFINE)
     nk = length(keep)
     curves = Vector{Matrix{Float64}}(undef, nk)
     peaks  = Matrix{Float64}(undef, nk, 2)
     quadr  = Matrix{Float64}(undef, nk, 2)
-    neutrinos = Matrix{Float64}(undef, nk, 2)
     charac = Matrix{Float64}(undef, nk, 2)
     snrs   = Vector{Float64}(undef, nk)
 
     for (k, r) in pairs(keep)
         # Below f_min = c / R_core the source is not coherent.
         fmin = C_LIGHT / r.R_core_m
-        fg = exp.(range(log(fmin), log(f_hi); length = n_curve + 1))
+        fg = exp.(range(log(fmin), log(f_hi); length = n_curve * refine + 1))
         lnf = log.(fg)
         Shg = [Sh(k, f) for f in fg]
-        curves[k] = hcat(fg, sqrt.(Shg))
+        # Every `refine`-th node, endpoints included: the plotted curve is a
+        # strict subset of the integration grid, so thinning it costs no accuracy.
+        curves[k] = hcat(fg[1:refine:end], sqrt.(@view Shg[1:refine:end]))
 
         # ∫Sₕ df = ∫f Sₕ dln f, and the centroid of the same measure.
         hc2 = trapz(lnf, fg .* Shg)
@@ -970,12 +923,9 @@ function _reduce(id::Integer, like::Real, keep::Vector{Row}, noise::NoiseCurve,
 
         quadr[k, 1] = f_quad(r.M_nuc, r.Λq_nuc)
         quadr[k, 2] = hcf_quad(r.M_nuc, r.Λq_nuc, r.Λh_nuc)
-
-        neutrinos[k, :] = tL_burst(r.rhoh_nuc)
-
     end
 
-    return EOSResult(id, like, keep, curves, peaks, charac, quadr, snrs, neutrinos)
+    return EOSResult(id, like, keep, curves, peaks, charac, quadr, snrs)
 end
 
 "Rows worth keeping: enough bubbles to collide, and a frequency we can plot."
@@ -1049,45 +999,6 @@ function process_eos_pt(br::Branch, prep::PreparedEoS, ptp::PTparams,
     end
 
     return _reduce(br.id, br.like, keep, noise, Sh; f_hi, n_curve, n_snr)
-end
-
-"""
-    envelope(curves; npts = 200) -> (f, upper, lower)
-
-Pointwise max/min band across a set of `(f, √Sₕ)` curves, computed in log-log
-space on a shared grid.
-
-The grid spans `min(first f)` to `min(last f)`: the left edge is the union of
-the curves (a curve only contributes once it has started, so the band widens as
-curves switch on), while the right edge is the intersection, so no curve is
-extrapolated.
-"""
-function envelope(curves::Vector{Matrix{Float64}}; npts::Integer = 200)
-    isempty(curves) && throw(ArgumentError("need at least one curve"))
-    f_left = [c[1, 1] for c in curves]
-    f_lo = minimum(f_left)
-    f_hi = minimum(c[end, 1] for c in curves)
-    grid = range(log(f_lo), log(f_hi); length = npts + 1)
-    itps = [Linear1D(log.(c[:, 1]), log.(c[:, 2])) for c in curves]
-
-    f = similar(collect(grid))
-    upper = similar(f)
-    lower = similar(f)
-    for (j, lnf) in pairs(grid)
-        fj = exp(lnf)
-        hi = -Inf
-        lo = Inf
-        for (itp, fl) in zip(itps, f_left)
-            fl ≤ fj || continue
-            v = itp(lnf)
-            hi = max(hi, v)
-            lo = min(lo, v)
-        end
-        f[j] = fj
-        upper[j] = exp(hi)
-        lower[j] = exp(lo)
-    end
-    return f, upper, lower
 end
 
 end # module
