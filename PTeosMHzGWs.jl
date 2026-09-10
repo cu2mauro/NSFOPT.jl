@@ -7,7 +7,7 @@ quark-hadron phase transition in accreting neutron stars.
 The pipeline, per accepted EOS sample `i`:
 
  1. [`prepare_eos`](@ref) builds, from the hadronic (`TOV`) and quark-branch
-    (`TOVext`) mass sequences, the overpressure `Δp(t - t₀)` driving nucleation
+    (`TOVext`) mass sequences, the overpressure `Δp` driving nucleation
     and the quark-core radius `R_c(M)`.
  2. [`compute_row`](@ref) integrates the bubble-nucleation associated ODE for one point of
     the (accretion rate, surface tension, Λ, wall velocity) grid and returns the
@@ -31,6 +31,7 @@ using Roots: find_zero, Brent
 
 export MonotoneCubic, Linear1D, domain, interp_loglog,
        Branch, load_branch, PTparams, load_PTparams, accepted_ids,
+       M_fallback, t_crit_of_M,
        PreparedEoS, prepare_eos,
        Row, compute_row, safe_row, sweep,
        NoiseCurve, load_noise_curve, Pgw, trapz, geometric_prefactor,
@@ -58,19 +59,38 @@ const N_FM3_TO_RHO14   = M_BARYON_MEV * MEV_FM3_TO_RHO14
 const D_SOURCE       = 10 * 3.0857e19     # source distance, m
 
 """
-Gravitational mass of the accreting star at `t = 0`, M⊙.
+    M_fallback(t) -> M⊙
 
-The mass→time coordinate `1000 (M - M_SEED)` is anchored here, so `t` is the
-accreted mass in units of 10⁻³ M⊙ and `t / a` is a time in ms. Δp is built from
-*differences* of this coordinate, so the anchor cancels there: moving it leaves
-`dp`, `tguess` and `M_at_nucleation` unchanged and only sets the zero of the
-reported accretion clock (`t0`, and hence `t_accrete_ms`).
+Gravitational mass at `t` ms after core collapse under fallback accretion,
+`M(t) = 1.2 + 0.63 (t/200)^0.3 - 20/(t + 200)`.
 
-Note that criticality is *not* guaranteed to lie above this seed: over the
-current 6516 accepted samples 10.3% cross onto the quark branch below 1.2 M⊙.
-Those get a negative `t_accrete_ms` — see [`Row`](@ref).
+`t = 0` is core collapse, so `M_fallback(0)` is the birth mass — never write
+that number out, it moves whenever this law does. Strictly increasing, hence
+invertible by [`t_crit_of_M`](@ref). `Ṁ` diverges as `t^-0.7` at the origin,
+but `M` itself is finite there, so only the inverse is ever needed.
+
+This law governs core collapse → criticality only. Past criticality the star
+switches to `M_crit + (t - t_crit) a / 1000` at the scanned rate `a`.
 """
-const M_SEED = 1.2
+M_fallback(t::Real) = 1.2 + 0.63 * (t / 200)^0.3 - 20 / (t + 200)
+
+"Largest critical mass considered, M⊙. Nothing above this is a neutron star."
+const M_MAX = 10.0
+
+"Inversion bracket for [`t_crit_of_M`](@ref), ms; the assert keeps it valid if the law changes."
+const T_MAX = 1.4e6
+@assert M_fallback(T_MAX) ≥ M_MAX "T_MAX no longer brackets M_MAX for this M_fallback"
+
+"""
+    t_crit_of_M(M_crit) -> ms
+
+Time from core collapse to criticality: the inverse of [`M_fallback`](@ref).
+
+`M_crit` must lie in `[M_fallback(0), M_MAX]`; [`prepare_eos`](@ref) drops the
+samples that do not (7.1% of the current 6516, already supercritical at birth).
+"""
+t_crit_of_M(M_crit::Real) =
+    find_zero(t -> M_fallback(t) - M_crit, (0.0, T_MAX), Brent())
 
 const RHO_KIN  = 3.2e33                   # J/m³
 const OMEGA_GW = 0.012
@@ -363,17 +383,19 @@ end
 
 Everything stage 2 needs from one EOS sample:
 
-- `dp`: overpressure Δp (GeV⁴) as a function of `t - t₀`, where `t` is the
-  time coordinate `1000 (M - M_SEED)` (mass measured in units of accreted M⊙, so
-  `t/a` is a time in ms once divided by the accretion rate).
-- `t0`: the offset above, i.e. the time at which the quark branch starts to
-  diverge from the hadronic one, measured from `M_SEED`. Negative for a sample
-  whose quark branch already wins below the seed mass.
+- `dp`: overpressure Δp (GeV⁴) against `1000 (M - M_crit)`, the mass accreted
+  past criticality in units of 10⁻³ M⊙. At rate `a` that argument is `a (t -
+  t_crit)` for `t` in ms, which is how [`compute_row`](@ref) drives it.
+- `M_crit`: gravitational mass at which the quark branch takes over, M⊙. Read
+  straight off the mass sequence — the EOS alone, no fallback input.
+- `t_crit`: time from core collapse to `M_crit` under [`M_fallback`](@ref), ms.
+  Fixed by the EOS, not by the sweep grid, hence computed once here.
 - `Rc`: quark-core radius (m) as a function of gravitational mass (M⊙).
 """
 struct PreparedEoS
     dp::MonotoneCubic
-    t0::Float64
+    M_crit::Float64
+    t_crit::Float64
     Rc::MonotoneCubic
     Λq::MonotoneCubic
     Λh::MonotoneCubic
@@ -384,8 +406,9 @@ end
     prepare_eos(br::Branch) -> Union{PreparedEoS, Nothing}
 
 Build the Δp and R_c interpolants for one sample, or `nothing` where there
-are no stable models, a stable set that is not a contiguous prefix of 
-the sequence, or no quark-over-hadron crossing.
+are no stable models, a stable set that is not a contiguous prefix of
+the sequence, no quark-over-hadron crossing, or a crossing outside
+`[M_fallback(0), M_MAX]`.
 """
 function prepare_eos(br::Branch)
     stab_idx  = findall(==(1.0), br.stab)
@@ -408,23 +431,28 @@ function prepare_eos(br::Branch)
     K = min(length(Mi), length(Mxi))
     K ≥ 2 || return nothing
 
-    tQ = 1000 .* (Mi[1:K]  .- M_SEED)
-    tH = 1000 .* (Mxi[1:K] .- M_SEED)
+    MQ = Mi[1:K]
+    MH = Mxi[1:K]
 
-    pQ = Linear1D(_sorted_unique(tQ, pci[1:K])...)
-    pH = Linear1D(_sorted_unique(tH, pcxi[1:K])...)
+    pQ = Linear1D(_sorted_unique(MQ, pci[1:K])...)
+    pH = Linear1D(_sorted_unique(MH, pcxi[1:K])...)
 
     pos = findfirst(k -> Mxi[k] - Mi[k] > 0, 1:K)
     (pos === nothing || pos ≤ 1) && return nothing
     pos -= 1
 
-    t0 = 1000 * (Mi[pos] - M_SEED)
-    tlo  = max(first(tQ), first(tH))
-    tmax = min(last(tQ), last(tH))
-    tgrid = filter(t -> tlo ≤ t ≤ tmax, sort!(union(tQ, tH)))
-    length(tgrid) ≥ 2 || return nothing
+    # Criticality, read straight off the mass sequence. A star already
+    # supercritical at birth never accretes up to it, so there is nothing to time.
+    M_crit = Mi[pos]
+    (M_fallback(0.0) ≤ M_crit ≤ M_MAX) || return nothing
+    t_crit = t_crit_of_M(M_crit)
 
-    dx, dy = _sorted_unique(tgrid .- t0, [_chop(pQ(t) - pH(t)) for t in tgrid])
+    Mlo  = max(first(MQ), first(MH))
+    Mhi  = min(last(MQ), last(MH))
+    Mgrid = filter(M -> Mlo ≤ M ≤ Mhi, sort!(union(MQ, MH)))
+    length(Mgrid) ≥ 2 || return nothing
+
+    dx, dy = _sorted_unique(1000 .* (Mgrid .- M_crit), [_chop(pQ(M) - pH(M)) for M in Mgrid])
     length(dx) ≥ 2 || return nothing
     dp = MonotoneCubic(dx, dy)
 
@@ -448,7 +476,7 @@ function prepare_eos(br::Branch)
     length(mx) ≥ 2 || return nothing
     rhoh = MonotoneCubic(mx, my)
 
-    return PreparedEoS(dp, t0, Rc, Λq, Λh, rhoh)
+    return PreparedEoS(dp, M_crit, t_crit, Rc, Λq, Λh, rhoh)
 end
 
 _chop(v::Float64) = abs(v) < CHOP_TOL ? 0.0 : v
@@ -486,20 +514,15 @@ One point of the parameter sweep and its outcome.
 threshold within the branch; `N_bubbles == -1` flags a numerical failure. Both
 are excluded by the `N_bubbles ≥ 2` cut applied downstream.
 
-The two accretion clocks are both in ms and both assume the constant rate `Ṁ = a`
-that the whole model is built on:
-
-- `t_accrete_ms` — total time from `M = M_SEED` (t = 0) to the transition,
-  i.e. `t0/a + tguess`. **Negative** whenever the sample crosses onto the quark
-  branch below `M_SEED`; that is not a numerical failure but a statement that
-  the star was already supercritical at the seed mass, so the accretion-time
-  interpretation does not apply to it. Filter on `t_accrete_ms ≥ 0` if you need
-  only the samples the seed assumption is valid for.
-- `t_nucleate_ms` — time from criticality to the transition, i.e. `tguess`.
-  Always ≥ 0, and anchor-independent.
+All times are in ms. `t_nuc_ms` is measured from core collapse, like every
+other time in the module:
+`t_crit` under [`M_fallback`](@ref), then the linear stage at the scanned rate
+`Ṁ = a`. Always ≥ `t_crit` > 0 — samples already supercritical at birth are
+dropped by [`prepare_eos`](@ref), never reported with a negative clock. The
+delay from criticality alone is `t_nuc_ms - prep.t_crit`.
 """
 struct Row
-    accretion::Float64      # Ṁ, M⊙/s
+    accretion::Float64      # Ṁ, M⊙/s, linear stage past criticality
     sigma_MeV_fm2::Float64  # surface tension
     Lambda_MeV::Float64     # nucleation energy scale
     v_wall::Float64         # wall velocity / c
@@ -507,16 +530,15 @@ struct Row
     R_bubble_m::Float64     # c / f_peak
     R_core_m::Float64       # quark core radius at transition
     N_bubbles::Float64
-    M_at_nucleation::Float64
-    Λq_at_nucleation::Float64
-    Λh_at_nucleation::Float64
-    rhoh_at_nucleation::Float64
-    t_accrete_ms::Float64   # M_SEED -> transition
-    t_nucleate_ms::Float64  # criticality -> transition
+    M_nuc::Float64          # gravitational mass at nucleation, M⊙
+    Λq_nuc::Float64
+    Λh_nuc::Float64
+    rhoh_nuc::Float64
+    t_nuc_ms::Float64       # core collapse -> nucleation
 end
 
-_failed(a, s, l, v) = Row(a, s, l, v, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-_never(a, s, l, v)  = Row(a, s, l, v, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+_failed(a, s, l, v) = Row(a, s, l, v, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+_never(a, s, l, v)  = Row(a, s, l, v, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 """
     compute_row(prep, accretion, sigma_MeV_fm2, Lambda_MeV, v_wall) -> Row
@@ -535,43 +557,48 @@ function compute_row(prep::PreparedEoS, accretion::Real, sigma_MeV_fm2::Real,
     lm = Float64(Lambda_MeV)
     v  = Float64(v_wall)
 
-    dp, t0b, Rc, Λq, Λh, rhoh = prep.dp, prep.t0, prep.Rc, prep.Λq, prep.Λh, prep.rhoh
+    dp, Rc, Λq, Λh, rhoh = prep.dp, prep.Rc, prep.Λq, prep.Λh, prep.rhoh
+    M_crit, t_crit = prep.M_crit, prep.t_crit
 
     σ = sg / GEV_TO_INVFM^2 / 1000
     Λ = lm / 1000 * GEV_TO_INVMS
-    t0a  = t0b / a
-    tmax = last(domain(dp)) / a
+
+    # Δp is keyed on mass accreted past criticality, so the ODE runs in the
+    # shifted variable τ = t - t_crit (ms since criticality) and `dp(a τ)` is
+    # the overpressure there. τ is local to this function; the returned time is
+    # shifted back to core collapse.
+    τmax = last(domain(dp)) / a
 
     S_target  = 4log(Λ) + 3log(v) + log(π / 3)
     dp_target = cbrt(13.5π^2 * σ^4 / S_target)
 
     # Δp peaks at the end of the branch; if even that is below threshold, no
     # bubble ever nucleates.
-    dp(a * tmax) < dp_target && return _never(a, sg, lm, v)
+    dp(a * τmax) < dp_target && return _never(a, sg, lm, v)
 
-    tlo = 1.0e-8 * tmax
+    τlo = 1.0e-8 * τmax
     froot(u) = dp(a * u) - dp_target
-    froot(tlo) ≥ 0 && return _failed(a, sg, lm, v)
+    froot(τlo) ≥ 0 && return _failed(a, sg, lm, v)
 
-    tguess = try
-        find_zero(froot, (tlo, tmax), Brent())
+    τ_nuc = try
+        find_zero(froot, (τlo, τmax), Brent())
     catch
         return _failed(a, sg, lm, v)
     end
 
-    tstart = max(tguess - 1, tguess / 2)
+    τstart = max(τ_nuc - 1, τ_nuc / 2)
     pref = (4π / 3) * v^3 * Λ^4
     Λ⁴ = Λ^4
     A = 13.5π^2 * σ^4
 
     # Δp ≤ 0 is pre-transition: no nucleation. (Δp → 0⁺ underflows to 0 anyway.)
-    @inline function rate(t)
-        Δ = dp(a * t)
+    @inline function rate(τ)
+        Δ = dp(a * τ)
         return Δ > 0 ? exp(-A / Δ^3) : 0.0
     end
 
-    function rhs!(du, u, _p, t)
-        f = rate(t)
+    function rhs!(du, u, _p, τ)
+        f = rate(τ)
         du[1] = f
         du[2] = u[1]
         du[3] = 2u[2]
@@ -580,8 +607,8 @@ function compute_row(prep::PreparedEoS, accretion::Real, sigma_MeV_fm2::Real,
         return nothing
     end
 
-    prob = ODEProblem(rhs!, zeros(5), (tstart, tmax))
-    saturated = ContinuousCallback((u, t, _i) -> pref * u[4] - 50, terminate!)
+    prob = ODEProblem(rhs!, zeros(5), (τstart, τmax))
+    saturated = ContinuousCallback((u, _τ, _i) -> pref * u[4] - 50, terminate!)
     sol = _solve_nucleation(prob, saturated)
     sol === nothing && return _failed(a, sg, lm, v)
 
@@ -592,21 +619,17 @@ function compute_row(prep::PreparedEoS, accretion::Real, sigma_MeV_fm2::Real,
     fpeak_MHz = cbrt(n_final) / 1000
     R_bubble  = C_LIGHT * 1e-6 / fpeak_MHz
 
-    # Accretion clocks (ms), both at the constant rate `a`: from the seed mass
-    # to the transition, and from criticality to the transition. `t_accrete` is
-    # < 0 for a sample already supercritical at M_SEED (see `Row`).
-    t_accrete = t0a + tguess
-    t_nucleate = tguess
+    # Back to time since core collapse, and the mass the linear stage reached.
+    t_nuc = t_crit + τ_nuc
+    M_nuc = M_crit + τ_nuc * a / 1000
 
-    # Gravitational mass at nucleation. Equal to M_crit + tguess*a/1000, so it
-    # is independent of where M_SEED is placed.
-    M_at_nucleation = M_SEED + t_accrete * a / 1000
-    R_core = M_at_nucleation < last(domain(Rc)) ? Rc(M_at_nucleation) : 0.0
-    Λq_at_nucleation = M_at_nucleation < last(domain(Λq)) ? Λq(M_at_nucleation) : 0.0
-    Λh_at_nucleation = M_at_nucleation < last(domain(Λh)) ? Λh(M_at_nucleation) : 0.0
-    rhoh_at_nucleation = M_at_nucleation < last(domain(rhoh)) ? rhoh(M_at_nucleation) : 0.0
+    R_core   = M_nuc < last(domain(Rc))   ? Rc(M_nuc)   : 0.0
+    Λq_nuc   = M_nuc < last(domain(Λq))   ? Λq(M_nuc)   : 0.0
+    Λh_nuc   = M_nuc < last(domain(Λh))   ? Λh(M_nuc)   : 0.0
+    rhoh_nuc = M_nuc < last(domain(rhoh)) ? rhoh(M_nuc) : 0.0
 
-    return Row(a, sg, lm, v, fpeak_MHz, R_bubble, R_core, (R_core / R_bubble)^3, M_at_nucleation, Λq_at_nucleation, Λh_at_nucleation, rhoh_at_nucleation, t_accrete, t_nucleate)
+    return Row(a, sg, lm, v, fpeak_MHz, R_bubble, R_core, (R_core / R_bubble)^3,
+               M_nuc, Λq_nuc, Λh_nuc, rhoh_nuc, t_nuc)
 end
 
 _ok(sol) = sol.retcode in (ReturnCode.Success, ReturnCode.Terminated)
@@ -945,10 +968,10 @@ function _reduce(id::Integer, like::Real, keep::Vector{Row}, noise::NoiseCurve,
         peaks[k, 1] = fpk
         peaks[k, 2] = sqrt(Sh(k, fpk))
 
-        quadr[k, 1] = f_quad(r.M_at_nucleation, r.Λq_at_nucleation)
-        quadr[k, 2] = hcf_quad(r.M_at_nucleation, r.Λq_at_nucleation, r.Λh_at_nucleation)
+        quadr[k, 1] = f_quad(r.M_nuc, r.Λq_nuc)
+        quadr[k, 2] = hcf_quad(r.M_nuc, r.Λq_nuc, r.Λh_nuc)
 
-        neutrinos[k, :] = tL_burst(r.rhoh_at_nucleation)
+        neutrinos[k, :] = tL_burst(r.rhoh_nuc)
 
     end
 

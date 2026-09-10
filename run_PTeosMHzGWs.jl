@@ -62,11 +62,11 @@ gr()
 const DATA_DIR = joinpath(@__DIR__, "..", "EOSsampler", "build")
 const OUT_DIR  = joinpath(@__DIR__, "results")
 
-const ACCRETIONS = 0.3:0.2:0.9      # Ṁ, M⊙/s
+const ACCRETIONS = 0.2:0.2:1.0     # Ṁ, M⊙/s, linear stage past criticality
 const SIGMAS     = 10.0:10.0:50.0   # surface tension, MeV/fm²
 const LAMBDAS    = [200.0]          # energy scale, MeV
 const VS_OLD     = 0.01:0.02:0.07   # wall velocity / c
-const VS         = [0.01, 0.02, 0.03, 0.05, 0.07, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70]
+const VS         = [0.01, 0.02, 0.03, 0.05, 0.07, 0.10, 0.15, 0.20, 0.30, 0.45, 0.65]
 
 # ColorDatas. Low likelihood → pale, high → dark, so the interesting EOS stand
 # out against the bulk; `by_z_order` reads the direction off the colour itself.
@@ -173,12 +173,12 @@ function save_results(path::AbstractString, results::Vector{EOSResult},
             f["$g/quadrupole"] = r.quadrupole
             f["$g/snr"] = r.snr
             f["$g/neutrinos"] = r.neutrinos
-            # 14 × n table, columns in `Row` field order.
+            # 13 × n table, columns in `Row` field order.
             f["$g/rows"] = reduce(hcat, [[x.accretion, x.sigma_MeV_fm2, x.Lambda_MeV,
                                           x.v_wall, x.fpeak_MHz, x.R_bubble_m,
-                                          x.R_core_m, x.N_bubbles, x.M_at_nucleation,
-                                          x.Λq_at_nucleation, x.Λh_at_nucleation, x.rhoh_at_nucleation,
-                                          x.t_accrete_ms, x.t_nucleate_ms] for x in r.rows])
+                                          x.R_core_m, x.N_bubbles, x.M_nuc,
+                                          x.Λq_nuc, x.Λh_nuc, x.rhoh_nuc,
+                                          x.t_nuc_ms] for x in r.rows])
             npt = size(first(r.curves), 1)
             curves = Array{Float64,3}(undef, npt, 2, length(r.curves))
             for (k, c) in pairs(r.curves)
@@ -231,8 +231,8 @@ function load_results(ids; outdir = OUT_DIR)
         end
     end
     isempty(legacy) || @warn """
-        results file(s) predate the accretion-clock columns; `t_accrete_ms` and \
-        `t_nucleate_ms` read back as NaN. Re-run `run_sweep` on them to fill these in.""" files = legacy
+        results file(s) are missing trailing `Row` columns, which read back as \
+        NaN. Re-run `run_sweep` on them to fill these in.""" files = legacy
     @info "loaded" files = ids eos = length(results) like_hi
     return results, like_hi, sources
 end
@@ -242,10 +242,11 @@ end
 
 Rebuild `Row`s from a saved `fieldcount(Row) × n` table.
 
-Files written before `t_accrete_ms`/`t_nucleate_ms` existed carry only the first
-12 columns. The missing ones are filled with `NaN` so old runs still re-plot,
-and so that reading a timing that was never computed shows up as `NaN` rather
-than as a plausible-looking zero.
+Short tables are padded with `NaN` so older runs still re-plot, and so that
+reading a quantity that was never computed shows up as `NaN` rather than as a
+plausible-looking zero. Tables written before the two accretion clocks collapsed
+into the single `t_nuc_ms` have 14 columns and are rejected outright: their
+timings mean something different, so they have to be re-swept.
 """
 function _rows_from_table(m::AbstractMatrix)
     nf, ncol = fieldcount(Row), size(m, 1)
