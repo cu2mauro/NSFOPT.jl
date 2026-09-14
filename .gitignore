@@ -2,3 +2,4 @@
 results/
 settings.local.json
 .claude/
+data/sample/accepted.json
