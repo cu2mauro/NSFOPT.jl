@@ -68,7 +68,7 @@
 # transition, when present, is always first order; a sample with no transition
 # carries pPT = 0 and is rejected by clause 2.
 
-using HDF5, JSON
+using HDF5, JSON, .Threads
 
 # Datasets a sample must have to be evaluated at all. All but `EOSext/p` are
 # read by the clauses; that one is kept as a guard, because a sample without an
@@ -112,7 +112,7 @@ function accepted_for(path; ids = nothing)
     acc = Int[]
     incomplete = Int[]
     h5open(path, "r") do f
-        for i in (ids === nothing ? sample_ids(f) : ids)
+        @threads for i in (ids === nothing ? sample_ids(f) : ids)
             g = string(i)
             if !complete_sample(f, g)
                 push!(incomplete, i)
@@ -149,7 +149,7 @@ function accepted_for(path; ids = nothing)
     return acc, incomplete
 end
 
-dir   = joinpath(@__DIR__, "..", "EOSsampler", "build")
+dir   = joinpath(@__DIR__, "..", "EOSsampler", "build", "run500k")
 files = sort(filter(endswith(".h5"), readdir(dir; join = true)))
 
 results = Dict{String,Vector{Int}}()

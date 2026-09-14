@@ -59,7 +59,7 @@ gr()
 # Defaults — every one is overridable per call, none needs editing to switch file
 # ---------------------------------------------------------------------------
 
-const DATA_DIR = joinpath(@__DIR__, "..", "EOSsampler", "build")
+const DATA_DIR = joinpath(@__DIR__, "..", "EOSsampler", "build", "run500k")
 const OUT_DIR  = joinpath(@__DIR__, "results")
 
 const ACCRETIONS = 0.2:0.2:1.0     # Ṁ, M⊙/s, linear stage past criticality
