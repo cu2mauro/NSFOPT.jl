@@ -1,5 +1,5 @@
-.CondaPkg/
-results/
+results/figures_0
+results/figures
 settings.local.json
 .claude/
 data/sample/accepted.json
