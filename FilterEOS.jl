@@ -68,7 +68,7 @@
 # transition, when present, is always first order; a sample with no transition
 # carries pPT = 0 and is rejected by clause 2.
 
-using HDF5, JSON, .Threads
+using HDF5, JSON
 
 # Datasets a sample must have to be evaluated at all. All but `EOSext/p` are
 # read by the clauses; that one is kept as a guard, because a sample without an
@@ -112,7 +112,14 @@ function accepted_for(path; ids = nothing)
     acc = Int[]
     incomplete = Int[]
     h5open(path, "r") do f
-        @threads for i in (ids === nothing ? sample_ids(f) : ids)
+        # Deliberately serial. Two things break under `@threads` here: `push!` onto
+        # the shared `acc`/`incomplete` vectors is not atomic, so accepted ids get
+        # lost or the buffer corrupted mid-grow; and HDF5.jl wraps a C library that
+        # is not built thread-safe, so concurrent `read`s through the one handle `f`
+        # are undefined behaviour. Both fail silently into a *wrong* accepted list,
+        # which every downstream result then inherits. Parallelise across files in
+        # the driver loop if this ever gets slow — one handle per file is the safe axis.
+        for i in (ids === nothing ? sample_ids(f) : ids)
             g = string(i)
             if !complete_sample(f, g)
                 push!(incomplete, i)

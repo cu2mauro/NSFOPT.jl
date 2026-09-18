@@ -162,6 +162,7 @@ Write a `Vector{EOSResult}` to HDF5: one group per sample id, plus a top-level
 """
 function save_results(path::AbstractString, results::Vector{EOSResult},
                       like_range::Tuple{Float64,Float64})
+    mkpath(dirname(path))   # results/ is gitignored, so it is absent on a fresh clone
     h5open(path, "w") do f
         f["like_range"] = collect(like_range)
         for r in results

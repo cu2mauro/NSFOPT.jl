@@ -47,7 +47,7 @@ const MEV_FM3_TO_SI  = 1.602176634e32     # 1 MeV/fm³ in J/m³
 const G_NEWTON       = 6.6743e-11         # SI
 const C_LIGHT        = 299792458.0        # SI
 
-const D_SOURCE       = 10 * 3.0857e19     # source distance, m
+const D_SOURCE       = 100 * 3.0857e19     # source distance, m
 
 """
     M_fallback(t) -> M⊙
@@ -250,18 +250,20 @@ end
 """
     Branch
 
-The mass sequences of one EOS sample: `M`/`pc`/`Rqm`/`stab` on the hadronic
+The mass sequences of one EOS sample: `Mb`/`pc`/`Rqm`/`stab` on the hadronic
 (`TOV`) branch, the `x`-suffixed fields on the quark (`TOVext`) branch, and
 `like`, the sample's total likelihood (`/params/ptot`).
 """
 struct Branch
     id::Int
     M::Vector{Float64}
+    muc::Vector{Float64}
     pc::Vector{Float64}
     Rqm::Vector{Float64}
     stab::Vector{Float64}
     Λtd::Vector{Float64}
     Mx::Vector{Float64}
+    mucx::Vector{Float64}
     pcx::Vector{Float64}
     stabx::Vector{Float64}
     Λtdx::Vector{Float64}
@@ -277,12 +279,14 @@ function load_branch(f, id::Integer)
     g = string(id)
     return Branch(
         id,
-        read(f, "$g/TOV/M"),
+        read(f, "$g/TOV/Mb"),
+        read(f, "$g/TOV/mu_cent"),
         read(f, "$g/TOV/p_cent"),
         read(f, "$g/TOV/Rqm"),
         read(f, "$g/TOV/stab"),
         read(f, "$g/TOV/Lambda"),
-        read(f, "$g/TOVext/M"),
+        read(f, "$g/TOVext/Mb"),
+        read(f, "$g/TOVext/mu_cent"),
         read(f, "$g/TOVext/p_cent"),
         read(f, "$g/TOVext/stab"),
         read(f, "$g/TOVext/Lambda"),
@@ -429,8 +433,10 @@ function prepare_eos(br::Branch)
     stab_idxx == 1:length(stab_idxx)  || return nothing
 
     Mi   = br.M[stab_idx]
+    muc  = br.muc[stab_idx]
     pci  = br.pc[stab_idx]  ./ GEV_TO_INVFM^3 ./ 1000
     Mxi  = br.Mx[stab_idxx]
+    mucx = br.mucx[stab_idxx]
     pcxi = br.pcx[stab_idxx] ./ GEV_TO_INVFM^3 ./ 1000
     Rqmi = br.Rqm[stab_idx] .* 1000
     Lambda = br.Λtd[stab_idx]
@@ -442,8 +448,11 @@ function prepare_eos(br::Branch)
     MQ = Mi[1:K]
     MH = Mxi[1:K]
 
-    pQ = Linear1D(_sorted_unique(MQ, pci[1:K])...)
-    pH = Linear1D(_sorted_unique(MH, pcxi[1:K])...)
+    # Time follows the accreting hadronic sequence, so it determines one
+    # chemical potential through the TOV baryonic-mass relation.
+    mu_of_M = Linear1D(_sorted_unique(MQ, muc[1:K])...)
+    pQ = Linear1D(_sorted_unique(muc[1:K], pci[1:K])...)
+    pH = Linear1D(_sorted_unique(mucx[1:K], pcxi[1:K])...)
 
     pos = findfirst(k -> Mxi[k] - Mi[k] > 0, 1:K)
     (pos === nothing || pos ≤ 1) && return nothing
@@ -460,7 +469,8 @@ function prepare_eos(br::Branch)
     Mgrid = filter(M -> Mlo ≤ M ≤ Mhi, sort!(union(MQ, MH)))
     length(Mgrid) ≥ 2 || return nothing
 
-    dx, dy = _sorted_unique(1000 .* (Mgrid .- M_crit), [_chop(pQ(M) - pH(M)) for M in Mgrid])
+    dx, dy = _sorted_unique(1000 .* (Mgrid .- M_crit),
+                            [_chop(pQ(mu_of_M(M)) - pH(mu_of_M(M))) for M in Mgrid])
     length(dx) ≥ 2 || return nothing
     dp = MonotoneCubic(dx, dy)
 
@@ -760,7 +770,7 @@ function hcf_quad(M::Float64, Λq::Float64, Λh::Float64)
     tau = tau_quad(M, Λq)
     χ = SPIN # * C_LIGHT / (G_NEWTON * M * 1.98847e30) since SPIN is already dimensionless
 
-    h0 = ETA_F * 4*pi*f^2 / C_LIGHT^2 / D_SOURCE * (G_NEWTON * M * 1.98847e30 / C_LIGHT^2)^3 * χ^2 * (Love_Q(Λh) - Love_Q(Λq))
+    h0 = ETA_F * 4*pi^2*f^2 / C_LIGHT^2 / D_SOURCE * (G_NEWTON * M * 1.98847e30 / C_LIGHT^2)^3 * χ^2 * (Love_Q(Λh) - Love_Q(Λq))
 
     return (h0*sqrt(tau/2))::Float64
 end
