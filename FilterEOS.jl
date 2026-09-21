@@ -23,11 +23,16 @@
 #
 # An accreting star climbs its hadronic sequence. Once the centre passes pPT the
 # hadronic phase is overpressed with respect to quark matter, and quark bubbles
-# can nucleate. The driver is the overpressure at fixed accreted mass,
+# can nucleate. The driver is the overpressure at fixed baryon mass,
 #
-#   Δp(t) = p_cent(TOV) − p_cent(TOVext),
+#   Δp(Mb) = p_q(μ_c) − p_h(μ_c),
 #
-# which enters the thin-wall O(4) bounce action S = 27π²σ⁴/(2Δp³): the
+# with μ_c the central chemical potential of the metastable (TOVext) star of
+# that baryon mass, and p_q, p_h the two EOS read at that same μ_c. It is not a
+# difference of central pressures at fixed mass: the two stars are compared at
+# equal μ, which is what makes the quark phase the favoured one.
+#
+# Δp enters the thin-wall O(4) bounce action S = 27π²σ⁴/(2Δp³): the
 # nucleation rate goes as exp(−S), so it is negligible until Δp has grown enough
 # and then switches on sharply. The transition completes in a shell of bubbles
 # whose size sets the GW peak frequency, and the quark-core radius at nucleation

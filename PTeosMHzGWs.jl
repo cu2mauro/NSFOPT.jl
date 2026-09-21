@@ -6,8 +6,8 @@ quark-hadron phase transition in accreting neutron stars.
 
 The pipeline, per accepted EOS sample `i`:
 
- 1. [`prepare_eos`](@ref) builds, from the hadronic (`TOV`) and quark-branch
-    (`TOVext`) mass sequences, the overpressure `Δp` driving nucleation
+ 1. [`prepare_eos`](@ref) builds, from the hybrid (`TOV`) and metastable
+    hadronic (`TOVext`) mass sequences, the overpressure `Δp` driving nucleation
     and the quark-core radius `R_c(M)`.
  2. [`compute_row`](@ref) integrates the bubble-nucleation associated ODE for one point of
     the (accretion rate, surface tension, Λ, wall velocity) grid and returns the
@@ -47,7 +47,7 @@ const MEV_FM3_TO_SI  = 1.602176634e32     # 1 MeV/fm³ in J/m³
 const G_NEWTON       = 6.6743e-11         # SI
 const C_LIGHT        = 299792458.0        # SI
 
-const D_SOURCE       = 100 * 3.0857e19     # source distance, m
+const D_SOURCE       = 10 * 3.0857e19     # source distance, m
 
 """
     M_fallback(t) -> M⊙
@@ -91,9 +91,9 @@ const ETA_F = 1.0
 const SPIN = 0.2
 
 "Upper frequency limit of the plotted/integrated band, Hz."
-const F_HI = 5.0e7
+const F_HI = 2.0e8
 "Intervals per strain curve as stored and plotted, so `N_F_CURVE + 1` points."
-const N_F_CURVE = 20
+const N_F_CURVE = 50
 
 """
     N_F_CHAR_REFINE
@@ -114,7 +114,7 @@ Keep the product at 60 or above.
 const N_F_CHAR_REFINE = 3
 
 "Points per SNR integral."
-const N_F_SNR = 200
+const N_F_SNR = 100
 
 "`Chop` threshold: default for zeroing small reals."
 const CHOP_TOL = 1.0e-16
@@ -250,13 +250,15 @@ end
 """
     Branch
 
-The mass sequences of one EOS sample: `Mb`/`pc`/`Rqm`/`stab` on the hadronic
-(`TOV`) branch, the `x`-suffixed fields on the quark (`TOVext`) branch, and
-`like`, the sample's total likelihood (`/params/ptot`).
+The mass sequences of one EOS sample: `M`(baryon)/`Mg`(gravitational)/`pc`/
+`Rqm`/`stab` on the hybrid (`TOV`) branch, the `x`-suffixed fields on the
+metastable hadronic (`TOVext`) branch, `mu`/`p` and `mux`/`px` the two EOS
+tables behind them, and `like`, the sample's total likelihood (`/params/ptot`).
 """
 struct Branch
     id::Int
     M::Vector{Float64}
+    Mg::Vector{Float64}
     muc::Vector{Float64}
     pc::Vector{Float64}
     Rqm::Vector{Float64}
@@ -280,6 +282,7 @@ function load_branch(f, id::Integer)
     return Branch(
         id,
         read(f, "$g/TOV/Mb"),
+        read(f, "$g/TOV/M"),
         read(f, "$g/TOV/mu_cent"),
         read(f, "$g/TOV/p_cent"),
         read(f, "$g/TOV/Rqm"),
@@ -398,13 +401,16 @@ Everything stage 2 needs from one EOS sample:
 - `dp`: overpressure Δp (GeV⁴) against `1000 (M - M_crit)`, the mass accreted
   past criticality in units of 10⁻³ M⊙. At rate `a` that argument is `a (t -
   t_crit)` for `t` in ms, which is how [`compute_row`](@ref) drives it.
-- `M_crit`: gravitational mass at which the quark branch takes over, M⊙. Read
+- `M_crit`: baryon mass at which the quark branch takes over, M⊙. Read
   straight off the mass sequence — the EOS alone, no fallback input.
 - `t_crit`: time from core collapse to `M_crit` under [`M_fallback`](@ref), ms.
   Fixed by the EOS, not by the sweep grid, hence computed once here.
-- `Rc`: quark-core radius (m) as a function of gravitational mass (M⊙).
+- `Rc`: quark-core radius (m) as a function of baryon mass (M⊙).
 - `Λq`, `Λh`: tidal deformability of the quark and hadronic branch against
-  gravitational mass (M⊙); both feed the spinning-quadrupole strain.
+  baryon mass (M⊙); both feed the spinning-quadrupole strain.
+- `Mg_q`: gravitational mass (M⊙) of the hybrid star of a given baryon mass.
+  The kHz relations are keyed on gravitational mass; everything else here on
+  baryon mass.
 """
 struct PreparedEoS
     dp::MonotoneCubic
@@ -413,6 +419,7 @@ struct PreparedEoS
     Rc::MonotoneCubic
     Λq::MonotoneCubic
     Λh::MonotoneCubic
+    Mg_q::MonotoneCubic
 end
 
 """
@@ -433,6 +440,7 @@ function prepare_eos(br::Branch)
     stab_idxx == 1:length(stab_idxx)  || return nothing
 
     Mi   = br.M[stab_idx]
+    Mgi  = br.Mg[stab_idx]
     muc  = br.muc[stab_idx]
     pci  = br.pc[stab_idx]  ./ GEV_TO_INVFM^3 ./ 1000
     Mxi  = br.Mx[stab_idxx]
@@ -448,9 +456,10 @@ function prepare_eos(br::Branch)
     MQ = Mi[1:K]
     MH = Mxi[1:K]
 
-    # Time follows the accreting hadronic sequence, so it determines one
-    # chemical potential through the TOV baryonic-mass relation.
-    mu_of_M = Linear1D(_sorted_unique(MQ, muc[1:K])...)
+    # Until a bubble nucleates the star is on the metastable hadronic branch, so
+    # its baryon mass fixes the central chemical potential there, not on the
+    # hybrid one.
+    mu_of_M = Linear1D(_sorted_unique(MH, mucx[1:K])...)
     pQ = Linear1D(_sorted_unique(muc[1:K], pci[1:K])...)
     pH = Linear1D(_sorted_unique(mucx[1:K], pcxi[1:K])...)
 
@@ -474,7 +483,7 @@ function prepare_eos(br::Branch)
     length(dx) ≥ 2 || return nothing
     dp = MonotoneCubic(dx, dy)
 
-    # R_c(M) over the full stable hadronic branch.
+    # R_c(M) over the stable hybrid branch.
     mx, my = _sorted_unique(Mi, Rqmi)
     length(mx) ≥ 2 || return nothing
     Rc = MonotoneCubic(mx, my)
@@ -489,7 +498,12 @@ function prepare_eos(br::Branch)
     length(mx) ≥ 2 || return nothing
     Λh = MonotoneCubic(mx, my)
 
-    return PreparedEoS(dp, M_crit, t_crit, Rc, Λq, Λh)
+    # Mg(Mb) over the stable hybrid branch.
+    mx, my = _sorted_unique(Mi, Mgi)
+    length(mx) ≥ 2 || return nothing
+    Mg_q = MonotoneCubic(mx, my)
+
+    return PreparedEoS(dp, M_crit, t_crit, Rc, Λq, Λh, Mg_q)
 end
 
 _chop(v::Float64) = abs(v) < CHOP_TOL ? 0.0 : v
@@ -523,16 +537,22 @@ end
 
 One point of the parameter sweep and its outcome.
 
-`N_bubbles == 0` with a zero `fpeak_MHz` means Δp never reached the nucleation
-threshold within the branch; `N_bubbles == -1` flags a numerical failure. Both
-are excluded by the `N_bubbles ≥ 2` cut applied downstream.
+`N_bubbles == 0` with a zero `fpeak_MHz` means the transition never happened —
+either Δp never reached the nucleation threshold within the branch, or the
+untransformed fraction `q` never fell to 1/2 before the branch ran out;
+`N_bubbles == -1` flags a numerical failure. Both are excluded by the
+`N_bubbles ≥ 2` cut applied downstream.
 
 All times are in ms. `t_nuc_ms` is measured from core collapse, like every
 other time in the module:
 `t_crit` under [`M_fallback`](@ref), then the linear stage at the scanned rate
-`Ṁ = a`. Always ≥ `t_crit` > 0 — samples already supercritical at birth are
-dropped by [`prepare_eos`](@ref), never reported with a negative clock. The
-delay from criticality alone is `t_nuc_ms - prep.t_crit`.
+`Ṁ = a` up to `q = 1/2`. Always ≥ `t_crit` > 0 — samples already supercritical
+at birth are dropped by [`prepare_eos`](@ref), never reported with a negative
+clock. The delay from criticality alone is `t_nuc_ms - prep.t_crit`.
+
+`M_nuc` is a baryon mass, as are the arguments of `R_core_m`, `Λq_nuc` and
+`Λh_nuc`. `Mg_nuc` is the gravitational mass of the same star, and is what the
+kHz quadrupole relations take.
 """
 struct Row
     accretion::Float64      # Ṁ, M⊙/s, linear stage past criticality
@@ -543,14 +563,15 @@ struct Row
     R_bubble_m::Float64     # c / f_peak
     R_core_m::Float64       # quark core radius at transition
     N_bubbles::Float64
-    M_nuc::Float64          # gravitational mass at nucleation, M⊙
+    M_nuc::Float64          # baryon mass at nucleation, M⊙
     Λq_nuc::Float64
     Λh_nuc::Float64
     t_nuc_ms::Float64       # core collapse -> nucleation
+    Mg_nuc::Float64         # gravitational mass of the hybrid star at M_nuc, M⊙
 end
 
-_failed(a, s, l, v) = Row(a, s, l, v, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0)
-_never(a, s, l, v)  = Row(a, s, l, v, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+_failed(a, s, l, v) = Row(a, s, l, v, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+_never(a, s, l, v)  = Row(a, s, l, v, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 """
     compute_row(prep, accretion, sigma_MeV_fm2, Lambda_MeV, v_wall) -> Row
@@ -561,6 +582,11 @@ The state is the chain `M₀' = f`, `K' = M₀`, `J' = 2K`, `V' = 3J`,
 `n' = Λ⁴ f exp(-pref·V)`, with `f(t) = exp(-13.5 π² σ⁴ / Δp(a t)³)` the
 Boltzmann-suppressed nucleation rate and `V` the exclusion volume. Integration
 stops once `pref·V > 50`, i.e. once the transition has saturated.
+
+Nucleation is dated by the untransformed fraction `q(τ) = exp(-pref·V(τ))`
+reaching 1/2, not by the bounce action crossing a threshold. The action root
+`τ_guess` only places the integration window; `t_nuc` and `M_nuc` come from
+`q = 1/2`, and the row is a `_never` sentinel if `q` never gets there.
 """
 function compute_row(prep::PreparedEoS, accretion::Real, sigma_MeV_fm2::Real,
                      Lambda_MeV::Real, v_wall::Real)
@@ -569,7 +595,7 @@ function compute_row(prep::PreparedEoS, accretion::Real, sigma_MeV_fm2::Real,
     lm = Float64(Lambda_MeV)
     v  = Float64(v_wall)
 
-    dp, Rc, Λq, Λh = prep.dp, prep.Rc, prep.Λq, prep.Λh
+    dp, Rc, Λq, Λh, Mg_q = prep.dp, prep.Rc, prep.Λq, prep.Λh, prep.Mg_q
     M_crit, t_crit = prep.M_crit, prep.t_crit
 
     σ = sg / GEV_TO_INVFM^2 / 1000
@@ -592,13 +618,15 @@ function compute_row(prep::PreparedEoS, accretion::Real, sigma_MeV_fm2::Real,
     froot(u) = dp(a * u) - dp_target
     froot(τlo) ≥ 0 && return _failed(a, sg, lm, v)
 
-    τ_nuc = try
+    # Where the bounce action crosses its threshold. This is only a bracket for
+    # the integration; nucleation itself is dated below by q = 1/2.
+    τ_guess = try
         find_zero(froot, (τlo, τmax), Brent())
     catch
         return _failed(a, sg, lm, v)
     end
 
-    τstart = max(τ_nuc - 1, τ_nuc / 2)
+    τstart = τ_guess / 2
     pref = (4π / 3) * v^3 * Λ^4
     Λ⁴ = Λ^4
     A = 13.5π^2 * σ^4
@@ -631,16 +659,47 @@ function compute_row(prep::PreparedEoS, accretion::Real, sigma_MeV_fm2::Real,
     fpeak_MHz = cbrt(n_final) / 1000
     R_bubble  = C_LIGHT * 1e-6 / fpeak_MHz
 
+    # Half the volume converted; if q never gets there the star never transitions.
+    τ_nuc = _tau_half(sol, pref)
+    τ_nuc === nothing && return _never(a, sg, lm, v)
+
     # Back to time since core collapse, and the mass the linear stage reached.
     t_nuc = t_crit + τ_nuc
     M_nuc = M_crit + τ_nuc * a / 1000
 
-    R_core = M_nuc < last(domain(Rc)) ? Rc(M_nuc) : 0.0
-    Λq_nuc = M_nuc < last(domain(Λq)) ? Λq(M_nuc) : 0.0
-    Λh_nuc = M_nuc < last(domain(Λh)) ? Λh(M_nuc) : 0.0
+    R_core = M_nuc <= last(domain(Rc)) ? Rc(M_nuc) : 0.0
+    Λq_nuc = M_nuc <= last(domain(Λq)) ? Λq(M_nuc) : 0.0
+    Λh_nuc = M_nuc <= last(domain(Λh)) ? Λh(M_nuc) : 0.0
+    Mg_nuc = Mg_q(M_nuc)
 
     return Row(a, sg, lm, v, fpeak_MHz, R_bubble, R_core, (R_core / R_bubble)^3,
-               M_nuc, Λq_nuc, Λh_nuc, t_nuc)
+               M_nuc, Λq_nuc, Λh_nuc, t_nuc, Mg_nuc)
+end
+
+"Half the volume still in the hadronic phase: `q = exp(-pref·u₄) = 1/2`."
+const LN2 = log(2)
+
+"""
+    _tau_half(sol, pref) -> τ or `nothing`
+
+Time at which the untransformed fraction `q(τ) = exp(-pref·u₄(τ))` falls to
+1/2, i.e. the root of `pref·u₄(τ) - ln 2`. `nothing` when `q` never reaches 1/2
+over the integrated window.
+
+`u₄` is monotone (its derivative `3u₃` is a triple integral of a non-negative
+rate), so the first saved point above the threshold brackets the root. Brent on
+the dense solution where there is one; otherwise linear in `ln q`, which is
+linear interpolation of `u₄` between the saved points.
+"""
+function _tau_half(sol, pref)
+    g(u) = pref * u[4] - LN2
+    i = findfirst(u -> g(u) ≥ 0, sol.u)
+    i === nothing && return nothing
+    i == 1 && return sol.t[1]
+    tlo, thi = sol.t[i-1], sol.t[i]
+    sol.dense && return find_zero(τ -> pref * sol(τ; idxs = 4) - LN2, (tlo, thi), Brent())
+    glo, ghi = g(sol.u[i-1]), g(sol.u[i])
+    return tlo + (thi - tlo) * (-glo) / (ghi - glo)
 end
 
 _ok(sol) = sol.retcode in (ReturnCode.Success, ReturnCode.Terminated)
@@ -650,19 +709,20 @@ _ok(sol) = sol.retcode in (ReturnCode.Success, ReturnCode.Terminated)
 
 Integrate with an explicit high-order Runge–Kutta method, falling back to a
 stiffness-switching method only if that fails outright.
+
+Steps are kept and dense output left on: [`_tau_half`](@ref) has to look back
+inside the solution for the step on which `q` crosses 1/2.
 """
 function _solve_nucleation(prob, cb)
     sol = try
-        solve(prob, Vern7(); callback = cb, abstol = 1e-8, reltol = 1e-8,
-              save_everystep = false, save_start = false)
+        solve(prob, Vern7(); callback = cb, abstol = 1e-8, reltol = 1e-8)
     catch
         nothing
     end
     (sol !== nothing && _ok(sol)) && return sol
 
     sol = try
-        solve(prob, AutoVern7(Rodas5P()); callback = cb, abstol = 1e-8, reltol = 1e-8,
-              save_everystep = false, save_start = false)
+        solve(prob, AutoVern7(Rodas5P()); callback = cb, abstol = 1e-8, reltol = 1e-8)
     catch
         return nothing
     end
@@ -725,7 +785,8 @@ function sweep(prep::PreparedEoS, accretions, sigmas, lambdas, v_ladder;
         rows = Row[]
         for v in vs
             r = safe_row(prep, a, s, l, v)
-            r.N_bubbles < n_min && break
+            r.N_bubbles ≥ n_min && (push!(rows, r); continue)
+            r.fpeak_MHz > 0 && break      # genuine transition with < n_min bubbles
             push!(rows, r)
         end
         out[k] = rows
@@ -931,8 +992,9 @@ function _reduce(id::Integer, like::Real, keep::Vector{Row}, noise::NoiseCurve,
         peaks[k, 1] = fpk
         peaks[k, 2] = sqrt(Sh(k, fpk))
 
-        quadr[k, 1] = f_quad(r.M_nuc, r.Λq_nuc)
-        quadr[k, 2] = hcf_quad(r.M_nuc, r.Λq_nuc, r.Λh_nuc)
+        # Gravitational mass: Zhao–Lattimer, Yagi–Yunes and Λ are all keyed on it.
+        quadr[k, 1] = f_quad(r.Mg_nuc, r.Λq_nuc)
+        quadr[k, 2] = hcf_quad(r.Mg_nuc, r.Λq_nuc, r.Λh_nuc)
     end
 
     return EOSResult(id, like, keep, curves, peaks, charac, quadr, snrs)

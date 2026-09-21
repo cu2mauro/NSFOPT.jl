@@ -63,7 +63,7 @@ const DATA_DIR = joinpath(@__DIR__, "..", "EOSsampler", "build", "run500k")
 const OUT_DIR  = joinpath(@__DIR__, "results")
 
 const ACCRETIONS = 0.2:0.2:1.0     # Ṁ, M⊙/s, linear stage past criticality
-const SIGMAS     = 10.0:10.0:50.0   # surface tension, MeV/fm²
+const SIGMAS     = 2.0:4.0:40.0   # surface tension, MeV/fm²
 const LAMBDAS    = [200.0]          # energy scale, MeV
 const VS         = [0.01, 0.02, 0.03, 0.05, 0.07, 0.10, 0.15, 0.20, 0.30, 0.45, 0.65]
 
@@ -73,7 +73,7 @@ const LIKE_CMAP   = cgrad(:GnBu, rev = false)
 const BUBBLE_CMAP = cgrad(:coolwarm)
 
 # Figure format: "pdf" for vector output (papers), "png" for a quick look.
-const FIG_EXT = "pdf"
+const FIG_EXT = "png"
 
 const PLOT_XLIMS = (5e2, 5e7)
 const PLOT_YLIMS = (1e-29, 1e-21)
@@ -172,12 +172,12 @@ function save_results(path::AbstractString, results::Vector{EOSResult},
             f["$g/characteristic"] = r.characteristic
             f["$g/quadrupole"] = r.quadrupole
             f["$g/snr"] = r.snr
-            # 12 × n table, columns in `Row` field order.
+            # 13 × n table, columns in `Row` field order.
             f["$g/rows"] = reduce(hcat, [[x.accretion, x.sigma_MeV_fm2, x.Lambda_MeV,
                                           x.v_wall, x.fpeak_MHz, x.R_bubble_m,
                                           x.R_core_m, x.N_bubbles, x.M_nuc,
                                           x.Λq_nuc, x.Λh_nuc,
-                                          x.t_nuc_ms] for x in r.rows])
+                                          x.t_nuc_ms, x.Mg_nuc] for x in r.rows])
             npt = size(first(r.curves), 1)
             curves = Array{Float64,3}(undef, npt, 2, length(r.curves))
             for (k, c) in pairs(r.curves)
