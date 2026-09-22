@@ -671,16 +671,19 @@ accepted list, not the sample id.
 
 This re-sweeps on its own denser grid, so it does not use the saved results.
 """
-function plot_bubbles(h5_id::Integer, index::Integer;
-                      accretions = 0.1:0.2:1.0, sigmas = 10.0:10.0:50.0,
-                      lambdas = LAMBDAS, vs = 0.005:0.01:0.3,
+function plot_bubbles(h5_id::Integer, index::Integer; actualindex = false,
+                      accretions = ACCRETIONS,
+                      sigmas     = [2,4,6,8,10],
+                      lambdas    = LAMBDAS,
+                      vs         = [0.01,0.02,0.03,0.04,0.05],
                       datadir = DATA_DIR, figdir = nothing, outdir = OUT_DIR,
                       ext::AbstractString = FIG_EXT)
     h5path = joinpath(datadir, "$h5_id.h5")
     accepted = accepted_ids(joinpath(datadir, "accepted.json"), "$h5_id.h5")
     1 ≤ index ≤ length(accepted) ||
-        error("index $index out of range (file $h5_id.h5 has $(length(accepted)) accepted samples)")
-    id = accepted[index]
+        (actualindex ||
+        error("index $index out of range (file $h5_id.h5 has $(length(accepted)) accepted samples)"))
+    id = actualindex ? index : accepted[index]
 
     prep = prepare_eos(h5open(f -> load_branch(f, id), h5path, "r"))
     prep === nothing && error("prepare_eos failed for sample $id of $h5_id.h5")
@@ -794,9 +797,11 @@ file holds one 1D dataset per plotted quantity plus a `meta` group:
 `path` defaults to `figures_<h5_id>/bubbles_<id>.h5` under `OUT_DIR`, next to the
 Julia figure. Pass `path` to write straight into the paper's data directory.
 """
-function export_bubbles(h5_id::Integer, index::Integer;
-                        accretions = 0.1:0.2:1.0, sigmas = 10.0:10.0:50.0,
-                        lambdas = LAMBDAS, vs = 0.005:0.01:0.3,
+function export_bubbles(h5_id::Integer, index::Integer; actualindex = false,
+                        accretions = ACCRETIONS,
+                        sigmas     = [2,4,6,8,10],
+                        lambdas    = LAMBDAS,
+                        vs         = [0.01,0.02,0.03,0.04,0.05],
                         datadir = DATA_DIR, outdir = OUT_DIR, path = nothing)
     # `vs` is deliberately coarser than `plot_bubbles` (10 wall velocities, not
     # 50): the matplotlib figure is uncluttered along v_w. Widen it here if the
@@ -804,8 +809,9 @@ function export_bubbles(h5_id::Integer, index::Integer;
     h5path = joinpath(datadir, "$h5_id.h5")
     accepted = accepted_ids(joinpath(datadir, "accepted.json"), "$h5_id.h5")
     1 ≤ index ≤ length(accepted) ||
-        error("index $index out of range (file $h5_id.h5 has $(length(accepted)) accepted samples)")
-    id = accepted[index]
+        (actualindex ||
+        error("index $index out of range (file $h5_id.h5 has $(length(accepted)) accepted samples)"))
+    id = actualindex ? index : accepted[index]
 
     prep = prepare_eos(h5open(f -> load_branch(f, id), h5path, "r"))
     prep === nothing && error("prepare_eos failed for sample $id of $h5_id.h5")
